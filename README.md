@@ -125,7 +125,3 @@ build.bat            # runs PyInstaller, outputs dist\KaliClaude.exe
   single-instance IPC socket binds to `127.0.0.1` exclusively.
 - Profiles, snapshots, and timestamped backups live under
   `%USERPROFILE%\.kalikot-claude-switcher\`.
-
-## 👨‍💻 Author
-
-**John Venice Almazan** — [@kalikot26](https://github.com/kalikot26)
