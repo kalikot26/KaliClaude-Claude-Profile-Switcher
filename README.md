@@ -14,6 +14,27 @@ history across accounts** so your projects and context follow you when you
 switch. Everything stays on your machine, and a standalone `.exe` means there's
 nothing to install.
 
+### What this project adds
+
+Switching Claude accounts *cleanly* — without losing your session or your
+history — is the whole problem this solves, and the approach here is original
+work:
+
+- 🖼️ **A real GUI** — a Windows desktop app for multi-account Claude Desktop,
+  instead of hand-editing config files or re-logging in every time.
+- 🔐 **DPAPI session-snapshot switching** — captures the *whole* Claude web session
+  (Session Storage, IndexedDB, cookies) plus the encrypted `oauth:tokenCache`
+  blob — the Claude-side counterpart to how the Codex switcher snapshots
+  `auth.json`. No tokens are rotated; the refresh token is never used.
+- 🛡️ **Session-kill-safe switching** — every copy/swap happens only while Claude is
+  fully stopped, and the live session is backed up before anything is
+  overwritten, so each step is recoverable.
+- 🧠 **Claude Code history sync** — merges every account's Claude Code & agent-mode
+  sessions so your projects and context follow you across logins (deletion-aware).
+
+> Sibling app for **Codex** accounts (built on the third-party `aisw` engine) —
+> [Codex Profile Switcher](https://github.com/kalikot26/Codex-Profile-Switcher).
+
 ## 🛠️ Built With
 
 - Python 3
