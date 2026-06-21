@@ -32,7 +32,7 @@ work:
 - 🧠 **Claude Code history sync** — merges every account's Claude Code & agent-mode
   sessions so your projects and context follow you across logins (deletion-aware).
 
-> Sibling app for **Codex** accounts (built on the third-party `aisw` engine) —
+> Sibling app for **Codex** accounts —
 > [Codex Profile Switcher](https://github.com/kalikot26/Codex-Profile-Switcher).
 
 ## 🛠️ Built With
