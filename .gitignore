@@ -1,0 +1,9 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+
+# Local env
+.venv/
+venv/
