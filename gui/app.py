@@ -82,6 +82,7 @@ CLAUDE_CONFIG = CLAUDE_DIR / "config.json"
 LOCAL_STATE   = CLAUDE_DIR / "Local State"   # holds the os_crypt AES key
 CLAUDE_LOG    = CLAUDE_DIR / "logs" / "main.log"  # LocalSessionManager load lines
 OAUTH_KEY     = "oauth:tokenCache"
+OAUTH_KEY_V2  = "oauth:tokenCacheV2"   # Claude Desktop migrated the live token cache here
 
 # A Claude login is the embedded claude.ai web session, not just the token.
 # These items (relative to CLAUDE_DIR) together make up that session; a profile
@@ -94,6 +95,12 @@ OAUTH_KEY     = "oauth:tokenCache"
 SESSION_ITEMS = [
     ("Session Storage",        "dir"),
     ("IndexedDB",              "dir"),
+    # Local Storage holds claude.ai's per-account state (accountUuid / account_uuid
+    # / token). It MUST swap with the account — leaving the outgoing account's
+    # Local Storage behind makes claude.ai see a conflicting account and log you
+    # out on every switch. (Was previously treated as shared; the claude.ai update
+    # that moved the token to oauth:tokenCacheV2 also put account state here.)
+    ("Local Storage",          "dir"),
     ("Network/Cookies",        "file"),
     ("Network/Cookies-journal", "file"),
 ]
@@ -105,8 +112,9 @@ SESSION_ITEMS = [
 # project list + history stay global across all profiles.
 CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
 
-# Cleared (in addition to SESSION_ITEMS) only when preparing a brand-new login.
-CLEAR_EXTRA = [("Local Storage", "dir")]
+# Local Storage is now part of SESSION_ITEMS (swapped per account), so nothing
+# extra needs clearing for a brand-new login.
+CLEAR_EXTRA: list = []
 
 USAGE_API   = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_API = "https://api.anthropic.com/api/oauth/profile"
@@ -184,11 +192,20 @@ def _write_config(cfg: dict) -> None:
     tmp.replace(CLAUDE_CONFIG)
 
 def _live_blob() -> Optional[str]:
+    """The live oauth token blob for the signed-in account, and the SINGLE source
+    of truth for the live token everywhere (capture, restore, backup, fingerprint,
+    presence, usage). Claude Desktop migrated the active token to
+    `oauth:tokenCacheV2` and left the legacy `oauth:tokenCache` empty, so prefer
+    V2 and fall back to the legacy key for older Claude builds. Nothing should read
+    the raw legacy key directly, or it will pick up the dead/empty blob."""
     cfg = _read_config()
     if not cfg:
         return None
-    blob = cfg.get(OAUTH_KEY)
-    return blob if isinstance(blob, str) and blob else None
+    for key in (OAUTH_KEY_V2, OAUTH_KEY):
+        blob = cfg.get(key)
+        if isinstance(blob, str) and blob:
+            return blob
+    return None
 
 def _fp(blob: Optional[str]) -> str:
     if not blob:
@@ -291,6 +308,12 @@ def _restore_session(name: str) -> None:
                 if live.exists():
                     shutil.rmtree(live, ignore_errors=True)
                 shutil.copytree(snap, live, dirs_exist_ok=True)
+            elif live.exists():
+                # Target snapshot lacks this store (e.g. an old snapshot with no
+                # Local Storage). Clear the live copy so the target never inherits
+                # the OUTGOING account's data — otherwise a stale accountUuid logs
+                # you straight back out. Claude rebuilds it from the restored cookie.
+                shutil.rmtree(live, ignore_errors=True)
         else:
             if snap.exists():
                 live.parent.mkdir(parents=True, exist_ok=True)
@@ -301,13 +324,14 @@ def _restore_session(name: str) -> None:
     blob = _load_blob(name)
     if blob:
         cfg = _read_config() or {}
-        cfg[OAUTH_KEY] = blob
+        cfg[OAUTH_KEY_V2] = blob   # Claude Desktop reads the live token from V2 now
+        cfg[OAUTH_KEY]    = blob   # keep the legacy key in sync for older builds
         _write_config(cfg)
 
 def _clear_live_session() -> None:
     """Remove the live web session + token so Claude shows a fresh login. Stopped.
-    Also clears Local Storage here (a real logout) even though it is shared during
-    normal switching — a brand-new account should start with a clean slate."""
+    Local Storage is cleared too (it is part of SESSION_ITEMS now, per-account), so
+    a brand-new login starts from a clean slate."""
     for rel, kind in list(SESSION_ITEMS) + CLEAR_EXTRA:
         live = CLAUDE_DIR / rel
         try:
@@ -319,8 +343,9 @@ def _clear_live_session() -> None:
         except OSError:
             pass
     cfg = _read_config()
-    if cfg and OAUTH_KEY in cfg:
+    if cfg and (OAUTH_KEY in cfg or OAUTH_KEY_V2 in cfg):
         cfg.pop(OAUTH_KEY, None)
+        cfg.pop(OAUTH_KEY_V2, None)   # clear the live-read key too, or the old token lingers
         _write_config(cfg)
 
 def _delete_profile_store(name: str) -> None:
@@ -650,6 +675,20 @@ def _claude_running() -> bool:
         return False
 
 def _kill_claude() -> None:
+    """Stop Claude Desktop. Try a GRACEFUL close first (WM_CLOSE) so Electron
+    flushes the session — token + Chromium session DBs — to disk. A hard /F kill
+    right after a login can lose or corrupt the just-written session, which shows
+    up as being logged out after a snapshot/switch. Force-kill only stragglers
+    that ignore the close (or minimize to tray) after a grace period."""
+    # graceful: ask each claude.exe window to close
+    subprocess.run(["taskkill", "/IM", "claude.exe"],
+                   capture_output=True, creationflags=_NOWIN)
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        if not _claude_running():
+            return
+        time.sleep(0.3)
+    # still up → force it
     subprocess.run(["taskkill", "/F", "/IM", "claude.exe"],
                    capture_output=True, creationflags=_NOWIN)
 
@@ -1277,18 +1316,27 @@ class App:
     # ----- actions ----------------------------------------------------------
 
     def _on_refresh_usage(self):
+        # ACTIVE ACCOUNT ONLY. Usage is read using the live account's own token
+        # (from oauth:tokenCacheV2) against the same OAuth endpoint Claude Code
+        # itself uses — indistinguishable from normal usage. We never read a
+        # non-active profile's stored token, which is the cross-account pattern
+        # that could look anomalous. Non-active profiles show their last cache.
         if self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         if not _CRYPTO_OK:
             messagebox.showwarning(
                 "Usage Unavailable",
-                "The encryption library isn't available, so usage can't be "
-                "read. (This build was made without it.)", parent=self.root)
+                "The encryption library isn't available, so usage can't be read.",
+                parent=self.root)
             return
         p = self._profiles[self._sel]
-        # Active profile → use the live config blob; others → their stored blob.
-        use_live = p.is_active
-        if not use_live and not p.has_blob:
+        if not p.is_active:
+            messagebox.showinfo(
+                "Active Account Only",
+                "Usage can only be refreshed for the account you're currently "
+                "signed into (the active profile). Other profiles show the last "
+                "cached numbers — switch to an account and refresh to update its "
+                "reset countdown.", parent=self.root)
             return
         name = p.name
         self._usage_busy = True
@@ -1297,24 +1345,24 @@ class App:
 
         def work():
             try:
-                blob = _live_blob() if use_live else _load_blob(name)
+                blob = _live_blob()   # active login; prefers oauth:tokenCacheV2
                 info = _token_info(blob) if blob else None
                 if not info or not info.get("token"):
                     self._q.put(("usage_err",
-                                 (name, "Couldn't read the session token for "
-                                        "this profile.")))
+                                 (name, "Couldn't read the active session token.")))
                     return
                 usage = _api_get(USAGE_API, info["token"])
                 if usage.get("_http_error") == 401:
                     self._q.put(("usage_err",
-                                 (name, "Session token expired. Switch to this "
-                                        "profile and open Claude once to refresh "
-                                        "it, then try again.")))
+                                 (name, "Session token expired. Open Claude once, "
+                                        "then try again.")))
                     return
                 if "_http_error" in usage or "_error" in usage:
                     self._q.put(("usage_err",
                                  (name, f"API request failed ({usage}).")))
                     return
+                # Cache the full metric dicts — they carry resets_at, so the reset
+                # countdown keeps ticking (and shows "reset") even from cache later.
                 result = {
                     "five_hour": usage.get("five_hour"),
                     "seven_day": usage.get("seven_day"),
@@ -1350,9 +1398,9 @@ class App:
         name, label, note = dlg.result
         if not messagebox.askyesno(
             "Save Current Login",
-            f"Capture the full current session as profile '{name}'.\n\n"
-            "Claude will be closed briefly to copy its session safely, then "
-            "you can reopen it. Continue?", parent=self.root):
+            f"Capture the current login as profile '{name}'.\n\n"
+            "Claude stays open — this reads the live session without closing it. "
+            "Continue?", parent=self.root):
             return
 
         self._busy = True
@@ -1360,11 +1408,7 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close.")
-                _capture_session(name)
+                _capture_session(name)   # live capture — Claude stays open
                 blob = _load_blob(name)
                 m = _load_meta()
                 info = m["profiles"].get(name, {})
@@ -1391,9 +1435,10 @@ class App:
             return
         if not messagebox.askyesno(
             "Update Snapshot",
-            f"Re-capture the CURRENT full session into profile '{p.name}'?\n\n"
+            f"Re-capture the CURRENT login into profile '{p.name}'?\n\n"
             "Use this only if the current login belongs to this profile.\n"
-            "Claude will be closed briefly to copy safely. Continue?",
+            "Claude stays open — the live session is read without closing it. "
+            "Continue?",
             parent=self.root):
             return
         name = p.name
@@ -1402,11 +1447,7 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close.")
-                _capture_session(name)
+                _capture_session(name)   # live capture — Claude stays open
                 blob = _load_blob(name)
                 m = _load_meta()
                 info = m["profiles"].setdefault(name, {})
@@ -1449,22 +1490,12 @@ class App:
                         raise RuntimeError(
                             "Claude did not close — try again or stop it manually.")
                 m = _load_meta()
-                active = m.get("active")
-                live = _live_blob()   # freshest token, captured after Claude stopped
-                need_save = bool(active and active != target
-                                 and live and active in m["profiles"])
-                ambiguous = False
-                if need_save:
-                    stored_fp = m["profiles"][active].get("fp", "")
-                    if stored_fp:
-                        if _fp(live) == stored_fp:
-                            need_save = False        # identical — nothing to capture
-                        else:
-                            ambiguous = True         # live differs — ask before save
-                self._switch_ctx = {"target": target, "active": active,
-                                    "need_save": need_save}
-                self._q.put(("switch_phase1",
-                             {"active": active, "ambiguous": ambiguous}))
+                # Restore-only switch: NEVER re-capture the outgoing account's
+                # snapshot. Snapshots are refreshed only when YOU choose, via
+                # Update Snapshot. The token lives ~a month, so a switch leaves the
+                # current account's snapshot completely untouched.
+                self._switch_ctx = {"target": target, "active": m.get("active")}
+                self._q.put(("switch_phase1", {}))
             except Exception as e:
                 self._q.put(("switch_err", str(e)))
 
@@ -1478,13 +1509,8 @@ class App:
         def work():
             try:
                 m = _load_meta()
-                # save-before-switch: capture the outgoing account's full session
-                if (ctx["need_save"] and ctx["active"]
-                        and ctx["active"] in m["profiles"]):
-                    _capture_session(ctx["active"])
-                    blob = _load_blob(ctx["active"])
-                    m["profiles"][ctx["active"]].update(
-                        updated=time.time(), fp=_fp(blob))
+                # Restore-only: the outgoing account's snapshot is intentionally
+                # left untouched (refresh it manually with Update Snapshot).
                 if not _has_session(ctx["target"]):
                     raise RuntimeError(
                         f"'{ctx['target']}' has no full-session snapshot. "
@@ -1614,28 +1640,7 @@ class App:
 
     def _handle_result(self, kind, data):
         if kind == "switch_phase1":
-            # Claude is stopped. If the live session differs from the outgoing
-            # profile's last snapshot, ask before overwriting it — this is the
-            # identity guard (we can't read account id from the encrypted blob).
-            if data.get("ambiguous"):
-                active = data.get("active")
-                ans = messagebox.askyesnocancel(
-                    "Update Outgoing Snapshot?",
-                    f"The current Claude login looks DIFFERENT from your last "
-                    f"saved snapshot of '{active}'.\n\n"
-                    f"•  Yes — you've been using '{active}' and its token just "
-                    f"refreshed; keep its snapshot current. (Usual choice.)\n\n"
-                    f"•  No — you logged into a DIFFERENT account since, so leave "
-                    f"'{active}'’s snapshot untouched.\n\n"
-                    f"•  Cancel — abort the switch.\n\n"
-                    f"Update '{active}'’s snapshot before switching?",
-                    parent=self.root)
-                if ans is None:               # Cancel → abort
-                    self._busy = False
-                    self._set_status("Switch cancelled.")
-                    self._refresh()
-                    return
-                self._switch_ctx["need_save"] = bool(ans)
+            # Restore-only switch: no outgoing re-capture, no prompt — go commit.
             self._start_switch_phase2()
         elif kind == "switch_ok":
             self._busy = False
@@ -1660,7 +1665,9 @@ class App:
             for i, p in enumerate(self._profiles):
                 if p.name == data:
                     self._select(i); break
-            if messagebox.askyesno(
+            # Live capture leaves Claude running — only offer to launch if it's
+            # actually closed, so a normal snapshot doesn't nag or steal focus.
+            if not _claude_running() and messagebox.askyesno(
                 "Launch Claude", f"Saved '{data}'.\n\nReopen Claude now?",
                 parent=self.root):
                 _launch_claude(_load_meta().get("aumid"))
