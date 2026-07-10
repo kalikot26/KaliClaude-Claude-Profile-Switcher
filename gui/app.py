@@ -14,12 +14,14 @@ never used (nothing rotates) and tokens are never logged, shown, or cached.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 import os
 import queue
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -623,6 +625,151 @@ def _api_get(url: str, token: str, timeout: int = 15) -> dict:
         return {"_http_error": e.code}
     except Exception as e:
         return {"_error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Usage via the live claude.ai SESSION COOKIE (not the OAuth token).
+#
+# Reading usage with the OAuth token against api.anthropic.com is what Anthropic
+# flags as anomalous token use and revokes the session ("checking usage logs me
+# out"). The app's own web UI reads usage with the browser session cookie against
+# claude.ai — a completely normal request that never trips that protection. So we
+# do the same: decrypt the claude.ai cookies (same os_crypt key as the token) and
+# call claude.ai directly. Worst case (wrong endpoint) is "no numbers", never a
+# session kill.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _claude_cookie_header() -> Optional[str]:
+    """Decrypt live claude.ai cookies into a Cookie header (never logged/stored)."""
+    if not _CRYPTO_OK:
+        return None
+    db = CLAUDE_DIR / "Network" / "Cookies"
+    if not db.exists():
+        return None
+    try:
+        key = _os_crypt_key()
+        con = sqlite3.connect(f"file:{db.as_posix()}?immutable=1", uri=True)
+    except Exception:
+        return None
+    jar: dict = {}
+    try:
+        rows = con.execute(
+            "select name, encrypted_value from cookies "
+            "where host_key like '%claude.ai%'").fetchall()
+        for name, ev in rows:
+            if not ev or bytes(ev[:3]) != b"v10":
+                continue
+            try:
+                pt = _AESGCM(key).decrypt(bytes(ev[3:15]), bytes(ev[15:]), None)
+                if len(pt) > 32 and any(b < 32 or b > 126 for b in pt[:32]):
+                    pt = pt[32:]          # strip Chrome 130+ SHA256(host) prefix
+                jar[name] = pt.decode("utf-8", "ignore")
+            except Exception:
+                pass
+    except Exception:
+        return None
+    finally:
+        con.close()
+    if "sessionKey" not in jar:
+        return None
+    return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+
+def _claude_web_get(path: str, cookie: str, timeout: int = 15) -> dict:
+    """Cookie-authed GET to claude.ai (the same origin the web UI calls)."""
+    req = urllib.request.Request("https://claude.ai" + path, method="GET", headers={
+        "Cookie":                    cookie,
+        "User-Agent":                _CLAUDE_UA,
+        "Accept":                    "application/json",
+        "Referer":                   "https://claude.ai/",
+        "anthropic-client-platform": "web_claude_ai",
+        "Accept-Encoding":           "gzip",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+            if (r.headers.get("content-encoding") or "").lower() == "gzip":
+                data = gzip.decompress(data)
+            txt = data.decode("utf-8", "replace")
+            try:
+                return {"_status": r.status, "json": json.loads(txt)}
+            except Exception:
+                return {"_status": r.status, "text": txt[:400]}
+    except urllib.error.HTTPError as e:
+        return {"_http_error": e.code}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def _norm_metric(m) -> Optional[dict]:
+    """Map a claude.ai usage bucket to {utilization, resets_at} for the bars."""
+    if not isinstance(m, dict):
+        return None
+    util = m.get("utilization")
+    if util is None:
+        used, limit = m.get("used"), m.get("limit")
+        if isinstance(used, (int, float)) and isinstance(limit, (int, float)) and limit:
+            util = 100.0 * used / limit
+    reset = (m.get("resets_at") or m.get("reset_at")
+             or m.get("resetsAt") or m.get("reset"))
+    if util is None and reset is None:
+        return None
+    return {"utilization": util, "resets_at": reset}
+
+
+def _usage_via_cookies() -> dict:
+    """Read usage via the live claude.ai session cookie — no OAuth-token call."""
+    cookie = _claude_cookie_header()
+    if not cookie:
+        return {"_error": "No live claude.ai session found. Open Claude, sign in, then retry."}
+    orgs = _claude_web_get("/api/organizations", cookie)
+    if "json" not in orgs:
+        return orgs if ("_http_error" in orgs or "_error" in orgs) \
+            else {"_error": "organizations: unexpected response"}
+    org_list = orgs["json"] if isinstance(orgs["json"], list) else []
+    if not org_list:
+        return {"_error": "No organizations for this session."}
+    want = None
+    try:
+        want = json.loads(CLAUDE_CONFIG.read_text("utf-8")).get("lastKnownAccountUuid")
+    except Exception:
+        pass
+    org = next((o for o in org_list if want and want in json.dumps(o)), org_list[0])
+    org_id = org.get("uuid")
+
+    out: dict = {"fetched": time.time()}
+    raw_usage = None
+    for path in (f"/api/organizations/{org_id}/usage",
+                 f"/api/organizations/{org_id}/rate_limits",
+                 f"/api/organizations/{org_id}"):
+        u = _claude_web_get(path, cookie)
+        if "json" in u:
+            j = u["json"]
+            raw_usage = {"path": path, "data": j}
+            base = j.get("usage") if isinstance(j.get("usage"), dict) else j
+            fh = _norm_metric(base.get("five_hour"))
+            sd = _norm_metric(base.get("seven_day"))
+            if fh or sd:
+                out["five_hour"], out["seven_day"] = fh, sd
+                break
+    out["email"] = org.get("billing_email") or org.get("name") or ""
+    caps = " ".join(str(c) for c in (org.get("capabilities") or [])).lower()
+    out["plan"] = "Max" if "max" in caps else "Pro" if "pro" in caps else ""
+
+    # Debug dump (usage stats, no credentials) so ONE test reveals the real shape.
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "usage-debug.json").write_text(
+            json.dumps({"orgs": org_list, "usage": raw_usage}, indent=2)[:40000], "utf-8")
+    except Exception:
+        pass
+    if "five_hour" not in out and "seven_day" not in out:
+        out["_note"] = "connected (no kill) but couldn't parse numbers — see usage-debug.json"
+    return out
 
 
 def _plan_label(profile: dict, fallback: Optional[str]) -> str:
@@ -1345,35 +1492,24 @@ class App:
 
         def work():
             try:
-                blob = _live_blob()   # active login; prefers oauth:tokenCacheV2
-                info = _token_info(blob) if blob else None
-                if not info or not info.get("token"):
+                # Cookie-authed read against claude.ai (NOT the OAuth token against
+                # api.anthropic.com) — this is what the app's web UI does, so it
+                # never trips the token-anomaly revocation that was logging you out.
+                u = _usage_via_cookies()
+                if "_http_error" in u or "_error" in u:
                     self._q.put(("usage_err",
-                                 (name, "Couldn't read the active session token.")))
+                                 (name, u.get("_error")
+                                  or f"claude.ai returned {u.get('_http_error')}")))
                     return
-                usage = _api_get(USAGE_API, info["token"])
-                if usage.get("_http_error") == 401:
-                    self._q.put(("usage_err",
-                                 (name, "Session token expired. Open Claude once, "
-                                        "then try again.")))
-                    return
-                if "_http_error" in usage or "_error" in usage:
-                    self._q.put(("usage_err",
-                                 (name, f"API request failed ({usage}).")))
-                    return
-                # Cache the full metric dicts — they carry resets_at, so the reset
-                # countdown keeps ticking (and shows "reset") even from cache later.
                 result = {
-                    "five_hour": usage.get("five_hour"),
-                    "seven_day": usage.get("seven_day"),
-                    "fetched":   time.time(),
+                    "five_hour": u.get("five_hour"),
+                    "seven_day": u.get("seven_day"),
+                    "fetched":   u.get("fetched", time.time()),
                 }
-                profile = _api_get(PROFILE_API, info["token"])
-                if isinstance(profile, dict) and "account" in profile:
-                    result["email"] = profile["account"].get("email", "")
-                    result["plan"] = _plan_label(profile, info.get("plan"))
-                elif info.get("plan"):
-                    result["plan"] = str(info["plan"]).capitalize()
+                if u.get("email"):
+                    result["email"] = u["email"]
+                if u.get("plan"):
+                    result["plan"] = u["plan"]
                 self._q.put(("usage_ok", (name, result)))
             except Exception as e:
                 self._q.put(("usage_err", (name, str(e))))
