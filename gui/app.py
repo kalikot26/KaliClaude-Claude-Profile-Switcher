@@ -97,12 +97,6 @@ OAUTH_KEY_V2  = "oauth:tokenCacheV2"   # Claude Desktop migrated the live token 
 SESSION_ITEMS = [
     ("Session Storage",        "dir"),
     ("IndexedDB",              "dir"),
-    # Local Storage holds claude.ai's per-account state (accountUuid / account_uuid
-    # / token). It MUST swap with the account — leaving the outgoing account's
-    # Local Storage behind makes claude.ai see a conflicting account and log you
-    # out on every switch. (Was previously treated as shared; the claude.ai update
-    # that moved the token to oauth:tokenCacheV2 also put account state here.)
-    ("Local Storage",          "dir"),
     ("Network/Cookies",        "file"),
     ("Network/Cookies-journal", "file"),
 ]
@@ -114,9 +108,10 @@ SESSION_ITEMS = [
 # project list + history stay global across all profiles.
 CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
 
-# Local Storage is now part of SESSION_ITEMS (swapped per account), so nothing
-# extra needs clearing for a brand-new login.
-CLEAR_EXTRA: list = []
+# Cleared (in addition to SESSION_ITEMS) only when preparing a brand-new login.
+# Local Storage is deliberately NOT swapped on a normal switch — it's shared UI
+# state and the login rides on the cookies. It's wiped only for a fresh sign-in.
+CLEAR_EXTRA = [("Local Storage", "dir")]
 
 USAGE_API   = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_API = "https://api.anthropic.com/api/oauth/profile"
@@ -310,12 +305,6 @@ def _restore_session(name: str) -> None:
                 if live.exists():
                     shutil.rmtree(live, ignore_errors=True)
                 shutil.copytree(snap, live, dirs_exist_ok=True)
-            elif live.exists():
-                # Target snapshot lacks this store (e.g. an old snapshot with no
-                # Local Storage). Clear the live copy so the target never inherits
-                # the OUTGOING account's data — otherwise a stale accountUuid logs
-                # you straight back out. Claude rebuilds it from the restored cookie.
-                shutil.rmtree(live, ignore_errors=True)
         else:
             if snap.exists():
                 live.parent.mkdir(parents=True, exist_ok=True)
@@ -332,8 +321,8 @@ def _restore_session(name: str) -> None:
 
 def _clear_live_session() -> None:
     """Remove the live web session + token so Claude shows a fresh login. Stopped.
-    Local Storage is cleared too (it is part of SESSION_ITEMS now, per-account), so
-    a brand-new login starts from a clean slate."""
+    Also clears Local Storage (via CLEAR_EXTRA) — it isn't swapped on a normal
+    switch, but a brand-new account should start from a clean slate."""
     for rel, kind in list(SESSION_ITEMS) + CLEAR_EXTRA:
         live = CLAUDE_DIR / rel
         try:
