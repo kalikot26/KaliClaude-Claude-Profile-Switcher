@@ -273,13 +273,23 @@ def _copy_item(src_base: Path, dst_base: Path, rel: str, kind: str) -> None:
         pass
 
 def _capture_session(name: str) -> None:
-    """Snapshot the live Claude session into the profile. Claude must be stopped."""
+    """Snapshot the live Claude session into the profile. Claude MUST be stopped —
+    otherwise the Cookies SQLite / leveldb stores are locked and copy incompletely."""
     sr = _session_root(name)
     if sr.exists():
         shutil.rmtree(sr, ignore_errors=True)
     sr.mkdir(parents=True, exist_ok=True)
     for rel, kind in SESSION_ITEMS:
         _copy_item(CLAUDE_DIR, sr, rel, kind)
+    # Guard: the login rides on the cookies. If the live Cookies exists but didn't
+    # make it into the snapshot, the copy was blocked (Claude still running) — fail
+    # loudly instead of saving a cookie-less snapshot that logs you out on switch.
+    live_ck = CLAUDE_DIR / "Network" / "Cookies"
+    snap_ck = sr / "Network" / "Cookies"
+    if live_ck.exists() and not snap_ck.exists():
+        raise RuntimeError(
+            "Could not copy the session cookies — Claude is still holding them. "
+            "Make sure Claude is fully closed, then try Update Snapshot again.")
     blob = _live_blob()
     if blob:
         _store_oauth(name, blob)
@@ -814,32 +824,50 @@ def _until_str(iso: Optional[str]) -> str:
 
 _NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
-def _claude_running() -> bool:
+def _desktop_claude_pids() -> list:
+    """PIDs of the Claude DESKTOP app ONLY.
+
+    CRITICAL: Claude Code (the CLI/agent) also runs as `claude.exe`, from
+    ...\\Roaming\\Claude\\claude-code\\...  — so matching by image name alone
+    conflates the two. That made 'is Claude stopped?' never true (Claude Code is
+    always running), so the snapshot ran while the Desktop app still held the
+    Cookies file locked -> a cookie-less snapshot -> login after switch. It also
+    risked force-killing the user's Claude Code session. We match the DESKTOP app
+    by executable path and explicitly exclude `claude-code`."""
     try:
         r = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/NH"],
-            capture_output=True, text=True, timeout=5, creationflags=_NOWIN)
-        return "claude.exe" in r.stdout.lower()
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+             "Where-Object { $_.ExecutablePath -and $_.ExecutablePath -notmatch 'claude-code' } | "
+             "Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=10, creationflags=_NOWIN)
+        return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
     except Exception:
-        return False
+        return []
+
+def _claude_running() -> bool:
+    return len(_desktop_claude_pids()) > 0
 
 def _kill_claude() -> None:
-    """Stop Claude Desktop. Try a GRACEFUL close first (WM_CLOSE) so Electron
-    flushes the session — token + Chromium session DBs — to disk. A hard /F kill
-    right after a login can lose or corrupt the just-written session, which shows
-    up as being logged out after a snapshot/switch. Force-kill only stragglers
-    that ignore the close (or minimize to tray) after a grace period."""
-    # graceful: ask each claude.exe window to close
-    subprocess.run(["taskkill", "/IM", "claude.exe"],
-                   capture_output=True, creationflags=_NOWIN)
+    """Stop the Claude DESKTOP app (never Claude Code). Graceful close first
+    (WM_CLOSE) so Electron flushes + releases the Cookies/session DBs; force-kill
+    only desktop stragglers after a grace period. Targets specific PIDs so this
+    can never touch the user's Claude Code session."""
+    pids = _desktop_claude_pids()
+    if not pids:
+        return
+    for pid in pids:                       # graceful: WM_CLOSE per desktop PID
+        subprocess.run(["taskkill", "/PID", str(pid)],
+                       capture_output=True, creationflags=_NOWIN)
     deadline = time.time() + 6.0
     while time.time() < deadline:
-        if not _claude_running():
-            return
+        if not _desktop_claude_pids():
+            break
         time.sleep(0.3)
-    # still up → force it
-    subprocess.run(["taskkill", "/F", "/IM", "claude.exe"],
-                   capture_output=True, creationflags=_NOWIN)
+    for pid in _desktop_claude_pids():     # force only desktop stragglers
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, creationflags=_NOWIN)
+    time.sleep(0.8)                        # let the OS release file handles
 
 def _wait_stopped(timeout: float = 6.0) -> bool:
     deadline = time.time() + timeout
