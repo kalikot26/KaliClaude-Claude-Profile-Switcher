@@ -1524,8 +1524,9 @@ class App:
         if not messagebox.askyesno(
             "Save Current Login",
             f"Capture the current login as profile '{name}'.\n\n"
-            "Claude stays open — this reads the live session without closing it. "
-            "Continue?", parent=self.root):
+            "Claude will be closed briefly to copy the session cleanly (a live "
+            "copy would be locked/incomplete), then you can reopen it. Continue?",
+            parent=self.root):
             return
 
         self._busy = True
@@ -1533,7 +1534,11 @@ class App:
 
         def work():
             try:
-                _capture_session(name)   # live capture — Claude stays open
+                if _claude_running():
+                    _kill_claude()
+                    if not _wait_stopped(6.0):
+                        raise RuntimeError("Claude did not close — try again or stop it manually.")
+                _capture_session(name)   # Claude stopped → clean, complete snapshot
                 blob = _load_blob(name)
                 m = _load_meta()
                 info = m["profiles"].get(name, {})
@@ -1562,8 +1567,8 @@ class App:
             "Update Snapshot",
             f"Re-capture the CURRENT login into profile '{p.name}'?\n\n"
             "Use this only if the current login belongs to this profile.\n"
-            "Claude stays open — the live session is read without closing it. "
-            "Continue?",
+            "Claude will be closed briefly to copy the session cleanly, then you "
+            "can reopen it. Continue?",
             parent=self.root):
             return
         name = p.name
@@ -1572,7 +1577,11 @@ class App:
 
         def work():
             try:
-                _capture_session(name)   # live capture — Claude stays open
+                if _claude_running():
+                    _kill_claude()
+                    if not _wait_stopped(6.0):
+                        raise RuntimeError("Claude did not close — try again or stop it manually.")
+                _capture_session(name)   # Claude stopped → clean, complete snapshot
                 blob = _load_blob(name)
                 m = _load_meta()
                 info = m["profiles"].setdefault(name, {})
@@ -1790,8 +1799,8 @@ class App:
             for i, p in enumerate(self._profiles):
                 if p.name == data:
                     self._select(i); break
-            # Live capture leaves Claude running — only offer to launch if it's
-            # actually closed, so a normal snapshot doesn't nag or steal focus.
+            # Capture closes Claude; offer to reopen it (guard in case it's
+            # somehow still running, so we don't nag / steal focus).
             if not _claude_running() and messagebox.askyesno(
                 "Launch Claude", f"Saved '{data}'.\n\nReopen Claude now?",
                 parent=self.root):
