@@ -1665,10 +1665,8 @@ class App:
                         raise RuntimeError(
                             "Claude did not close — try again or stop it manually.")
                 m = _load_meta()
-                # Restore-only switch: NEVER re-capture the outgoing account's
-                # snapshot. Snapshots are refreshed only when YOU choose, via
-                # Update Snapshot. The token lives ~a month, so a switch leaves the
-                # current account's snapshot completely untouched.
+                # Phase 2 will capture the outgoing account's current session before
+                # restoring the target (sessionKey rotates in use — keep it fresh).
                 self._switch_ctx = {"target": target, "active": m.get("active")}
                 self._q.put(("switch_phase1", {}))
             except Exception as e:
@@ -1684,8 +1682,18 @@ class App:
         def work():
             try:
                 m = _load_meta()
-                # Restore-only: the outgoing account's snapshot is intentionally
-                # left untouched (refresh it manually with Update Snapshot).
+                # Capture the OUTGOING account's CURRENT session first (Claude is
+                # already stopped, so this is a clean capture). claude.ai ROTATES the
+                # sessionKey while an account is in use — a stale snapshot holds a
+                # superseded key the server rejects on the next switch back, which is
+                # the intermittent "logged out after switch". Re-capturing on
+                # switch-away keeps each account's snapshot key current. This is what
+                # the old working version did; removing it (restore-only) broke it.
+                out = ctx.get("active")
+                if out and out != ctx["target"] and out in m["profiles"] and _live_blob():
+                    _capture_session(out)
+                    b = _load_blob(out)
+                    m["profiles"][out].update(updated=time.time(), fp=_fp(b))
                 if not _has_session(ctx["target"]):
                     raise RuntimeError(
                         f"'{ctx['target']}' has no full-session snapshot. "
