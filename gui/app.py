@@ -655,18 +655,16 @@ _CLAUDE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
-def _claude_cookie_header() -> Optional[str]:
-    """Decrypt live claude.ai cookies into a Cookie header (never logged/stored)."""
-    if not _CRYPTO_OK:
-        return None
-    db = CLAUDE_DIR / "Network" / "Cookies"
-    if not db.exists():
+def _cookies_from_db(db) -> Optional[str]:
+    """Decrypt claude.ai cookies from ONE Cookies SQLite file into a Cookie header.
+    Returns None if the file is missing / locked / has no sessionKey."""
+    if not db or not db.exists():
         return None
     try:
         key = _os_crypt_key()
         con = sqlite3.connect(f"file:{db.as_posix()}?immutable=1", uri=True)
     except Exception:
-        return None
+        return None    # exclusively locked (the live file while Claude runs) or unreadable
     jar: dict = {}
     try:
         rows = con.execute(
@@ -689,6 +687,27 @@ def _claude_cookie_header() -> Optional[str]:
     if "sessionKey" not in jar:
         return None
     return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+
+def _claude_cookie_header() -> Optional[str]:
+    """claude.ai cookies as a Cookie header (never logged/stored).
+
+    The LIVE Cookies file is EXCLUSIVELY LOCKED while Claude Desktop is running, so
+    it usually can't be read at all — fall back to the ACTIVE profile's snapshot
+    cookies, an unlocked copy of the same account's session (valid sessionKey). Try
+    live first in case Claude happens to be closed (freshest)."""
+    if not _CRYPTO_OK:
+        return None
+    hdr = _cookies_from_db(CLAUDE_DIR / "Network" / "Cookies")   # live (if unlocked)
+    if hdr:
+        return hdr
+    try:                                                         # active snapshot
+        active = _load_meta().get("active")
+        if active:
+            return _cookies_from_db(_session_root(active) / "Network" / "Cookies")
+    except Exception:
+        pass
+    return None
 
 
 def _claude_web_get(path: str, cookie: str, timeout: int = 15) -> dict:
