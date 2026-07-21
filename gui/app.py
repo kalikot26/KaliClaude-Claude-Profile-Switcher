@@ -690,24 +690,17 @@ def _cookies_from_db(db) -> Optional[str]:
 
 
 def _claude_cookie_header() -> Optional[str]:
-    """claude.ai cookies as a Cookie header (never logged/stored).
+    """claude.ai cookies as a Cookie header — the LIVE session ONLY.
 
-    The LIVE Cookies file is EXCLUSIVELY LOCKED while Claude Desktop is running, so
-    it usually can't be read at all — fall back to the ACTIVE profile's snapshot
-    cookies, an unlocked copy of the same account's session (valid sessionKey). Try
-    live first in case Claude happens to be closed (freshest)."""
+    SAFETY (do not "improve" this): never fall back to a profile SNAPSHOT's cookies.
+    A snapshot can hold a SUPERSEDED sessionKey (claude.ai rotates it), and sending a
+    rotated-away session token is indistinguishable from a stolen-session replay — the
+    server's response is to REVOKE the account's sessions. That killed live sessions.
+    Only the current live cookie is safe to send, and it is only readable while Claude
+    Desktop is closed (it holds an exclusive lock on the file)."""
     if not _CRYPTO_OK:
         return None
-    hdr = _cookies_from_db(CLAUDE_DIR / "Network" / "Cookies")   # live (if unlocked)
-    if hdr:
-        return hdr
-    try:                                                         # active snapshot
-        active = _load_meta().get("active")
-        if active:
-            return _cookies_from_db(_session_root(active) / "Network" / "Cookies")
-    except Exception:
-        pass
-    return None
+    return _cookies_from_db(CLAUDE_DIR / "Network" / "Cookies")
 
 
 def _claude_web_get(path: str, cookie: str, timeout: int = 15) -> dict:
@@ -756,7 +749,13 @@ def _usage_via_cookies() -> dict:
     """Read usage via the live claude.ai session cookie — no OAuth-token call."""
     cookie = _claude_cookie_header()
     if not cookie:
-        return {"_error": "No live claude.ai session found. Open Claude, sign in, then retry."}
+        return {"_error":
+                "Can't read the live session while Claude Desktop is running — it "
+                "holds an exclusive lock on the cookie file.\n\n"
+                "Click 'Stop Claude', then Refresh Usage, then Launch Claude again.\n\n"
+                "(We deliberately never fall back to a saved snapshot's cookie: that "
+                "key may be superseded, and replaying it makes the server revoke your "
+                "session.)"}
     orgs = _claude_web_get("/api/organizations", cookie)
     if "json" not in orgs:
         return orgs if ("_http_error" in orgs or "_error" in orgs) \
