@@ -524,11 +524,12 @@ class App:
         self._usage_busy = False
         self._startup_error = ""
         self._migration_report = None
+        self._email_cache: dict[str, str] = {}
 
         try:
             self._migration_report = _desktop_backend().audit_and_migrate()
         except Exception as error:
-            self._startup_error = str(error)
+            self._startup_error = str(error) or type(error).__name__
 
         self._build()
         _start_ipc(lambda: self.root.after(0, self._focus))
@@ -994,6 +995,8 @@ class App:
         for button in (self._btn_save, self._btn_prepare, self._btn_sync):
             button.configure(state=tk.NORMAL)
         self._profiles = _list_profiles()
+        for profile in self._profiles:
+            profile.email = self._email_cache.get(profile.name, profile.email)
         if self._sel >= len(self._profiles):
             self._sel = len(self._profiles) - 1
         self._render_list()
@@ -1150,7 +1153,10 @@ class App:
 
         def work():
             try:
-                _desktop_backend().verify_profile(name)
+                profile = _desktop_backend().verify_profile(name)
+                if profile.state == ProfileState.CORRUPT:
+                    self._q.put(("verify_err", profile.issue or "Profile verification failed"))
+                    return
                 self._q.put(("verify_ok", name))
             except Exception as e:
                 self._q.put(("verify_err", str(e)))
@@ -1217,15 +1223,27 @@ class App:
         self._set_status("Preparing new login…")
 
         def work():
+            pending = None
             try:
                 backend = _desktop_backend()
                 backend.stop_desktop()
                 pending = backend.begin_new_login()
-                launch = backend.launch_active()
-                if not launch.ok:
-                    raise RuntimeError(launch.message or "Pending login launch failed")
-                if launch.user_data_dir != pending.user_data_dir:
-                    raise RuntimeError("Managed launch did not use the pending login root")
+                try:
+                    launch = backend.launch_active()
+                    if not launch.ok:
+                        raise RuntimeError(launch.message or "Pending login launch failed")
+                    if launch.user_data_dir != pending.user_data_dir:
+                        raise RuntimeError("Managed launch did not use the pending login root")
+                except Exception as launch_error:
+                    try:
+                        backend.discard_pending_login(pending.name)
+                    except Exception as cleanup_error:
+                        raise RuntimeError(
+                            f"{str(launch_error) or type(launch_error).__name__}; "
+                            "pending-login cleanup also failed: "
+                            f"{str(cleanup_error) or type(cleanup_error).__name__}"
+                        ) from launch_error
+                    raise
                 self._q.put(("prep_ok", (pending, launch)))
             except Exception as e:
                 self._q.put(("prep_err", str(e)))
@@ -1269,10 +1287,22 @@ class App:
         try:
             while True:
                 kind, data = self._q.get_nowait()
-                self._handle_result(kind, data)
+                try:
+                    self._handle_result(kind, data)
+                except Exception as error:
+                    try:
+                        self._set_status(
+                            f"Background update failed: {str(error) or type(error).__name__}"
+                        )
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
-        self.root.after(150, self._pump)
+        finally:
+            try:
+                self.root.after(150, self._pump)
+            except tk.TclError:
+                pass
 
     def _handle_result(self, kind, data):
         if kind == "switch_ok":
@@ -1298,13 +1328,7 @@ class App:
                     parent=self.root,
                 )
             if result.should_relaunch:
-                launch = _desktop_backend().launch_active()
-                if not launch.ok:
-                    messagebox.showerror(
-                        "Launch Failed", launch.message or "Managed relaunch failed.",
-                        parent=self.root,
-                    )
-                    self._set_status(f"Switched, but relaunch failed: {launch.message}")
+                self._start_launch()
         elif kind == "rollback_err":
             self._busy = False
             message, recovery = data
@@ -1333,10 +1357,7 @@ class App:
             if messagebox.askyesno(
                 "Launch Claude", f"Saved '{data}'.\n\nReopen Claude now?",
                 parent=self.root):
-                launch = _desktop_backend().launch_active()
-                if not launch.ok:
-                    messagebox.showerror("Launch Failed", launch.message, parent=self.root)
-                self._set_status("Launching Claude…")
+                self._start_launch()
         elif kind == "save_err":
             self._busy = False
             messagebox.showerror("Save Failed", data, parent=self.root)
@@ -1367,17 +1388,6 @@ class App:
             messagebox.showerror("Prepare Failed", data, parent=self.root)
             self._set_status(f"Prepare failed: {data}")
             self._refresh()
-        elif kind == "prep_recovery":
-            self._busy = False
-            message, recovery = data
-            messagebox.showerror(
-                "New Login Recovery Required",
-                f"{message}\n\nDo not launch Claude Desktop. The verified recovery "
-                f"backup is here:\n\n{recovery}",
-                parent=self.root,
-            )
-            self._set_status(f"Recovery required — backup: {recovery}")
-            self._refresh()
         elif kind == "sync_ok":
             self._busy = False
             added = (data or {}).get("added", 0)
@@ -1400,8 +1410,41 @@ class App:
         elif kind == "tick":
             self._apply_tick(*data)
             self.root.after(5000, self._tick)
+        elif kind == "launch_ok":
+            self._busy = False
+            self._claude_up = True
+            self._refresh_claude_ui()
+            self._set_status("Claude launched with the selected profile.")
+        elif kind == "launch_err":
+            self._busy = False
+            messagebox.showerror("Launch Failed", data, parent=self.root)
+            self._set_status(f"Launch failed: {data}")
+        elif kind == "stop_ok":
+            self._busy = False
+            self._claude_up = False
+            self._refresh_claude_ui()
+            self._set_status("Claude stopped.")
+        elif kind == "stop_err":
+            self._busy = False
+            messagebox.showerror("Stop Failed", data, parent=self.root)
+            self._set_status(f"Stop failed: {data}")
         elif kind == "usage_ok":
             name, result = data
+            cache_error = ""
+            safe_usage = {
+                key: result.get(key)
+                for key in ("five_hour", "seven_day", "fetched")
+                if result.get(key) is not None
+            }
+            try:
+                _desktop_backend().update_profile_usage(
+                    name, safe_usage, str(result.get("plan") or "")
+                )
+            except Exception as error:
+                cache_error = str(error) or type(error).__name__
+            email = result.get("email")
+            if isinstance(email, str) and email:
+                self._email_cache[name] = email
             for profile in self._profiles:
                 if profile.name == name:
                     profile.usage = result
@@ -1409,7 +1452,10 @@ class App:
                     profile.plan = result.get("plan") or profile.plan
                     break
             self._usage_busy = False
-            self._set_status(f"Usage updated for '{name}'.")
+            if cache_error:
+                self._set_status(f"Usage updated; cache save failed: {cache_error}")
+            else:
+                self._set_status(f"Usage updated for '{name}'.")
             if 0 <= self._sel < len(self._profiles):
                 self._render_usage(self._profiles[self._sel])
         elif kind == "usage_err":
@@ -1444,15 +1490,25 @@ class App:
     def _save_note(self):
         return
 
+    def _start_launch(self):
+        self._busy = True
+        self._set_status("Launching Claude…")
+
+        def work():
+            try:
+                launch = _desktop_backend().launch_active()
+                if not launch.ok:
+                    raise RuntimeError(launch.message or "Managed launch failed")
+                self._q.put(("launch_ok", launch))
+            except Exception as error:
+                self._q.put(("launch_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_launch(self):
         if not self._action_ready():
             return
-        launch = _desktop_backend().launch_active()
-        if not launch.ok:
-            messagebox.showerror("Launch Failed", launch.message, parent=self.root)
-            self._set_status(f"Launch failed: {launch.message}")
-            return
-        self._set_status("Launching Claude…")
+        self._start_launch()
 
     def _on_stop(self):
         if not self._action_ready():
@@ -1460,15 +1516,17 @@ class App:
         if not messagebox.askyesno("Stop Claude", "Close Claude Desktop?",
                                    parent=self.root):
             return
-        try:
-            _desktop_backend().stop_desktop()
-        except Exception as error:
-            messagebox.showerror("Stop Failed", str(error), parent=self.root)
-            self._set_status(f"Stop failed: {error}")
-            return
-        self._claude_up = False
-        self._refresh_claude_ui()
-        self._set_status("Claude stopped.")
+        self._busy = True
+        self._set_status("Stopping Claude…")
+
+        def work():
+            try:
+                _desktop_backend().stop_desktop()
+                self._q.put(("stop_ok", None))
+            except Exception as error:
+                self._q.put(("stop_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _set_status(self, msg):
         self._st.configure(text=msg)

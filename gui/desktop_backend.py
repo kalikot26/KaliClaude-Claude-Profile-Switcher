@@ -219,8 +219,15 @@ class WindowsDesktopProcessAdapter:
 
     _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        platform_name: str | None = None,
+        launcher: Callable[..., Any] | None = None,
+    ) -> None:
         self._managed_pids: dict[int, str] = {}
+        self._platform_name = platform_name or os.name
+        self._launcher = launcher or subprocess.Popen
 
     def _run(self, command: str) -> str:
         completed = subprocess.run(
@@ -282,7 +289,7 @@ class WindowsDesktopProcessAdapter:
         return candidates[0]
 
     def _verified_desktop_processes(self) -> list[_VerifiedDesktopProcess]:
-        if os.name != "nt":
+        if self._platform_name != "nt":
             raise OSError("Claude Desktop switching is Windows-only")
         rows = json.loads(
             self._run(
@@ -367,7 +374,9 @@ class WindowsDesktopProcessAdapter:
             subprocess.run(["taskkill.exe", "/F", "/PID", str(int(pid))], capture_output=True, timeout=8, creationflags=self._NO_WINDOW)
 
     def launch(self, executable: ExecutableSpec, env: dict[str, str]) -> None:
-        process = subprocess.Popen([str(executable.path)], env=env, creationflags=self._NO_WINDOW)
+        process = self._launcher(
+            [str(executable.path)], env=env, creationflags=self._NO_WINDOW
+        )
         if isinstance(process.pid, int):
             self._managed_pids[process.pid] = ""
             try:
@@ -532,6 +541,61 @@ class DesktopBackend:
             meta["pending_login"] = {"name": name, "created": time.time()}
             self._save_meta(meta)
             return PendingLogin(name, root)
+        finally:
+            self._clear_decryption_cache()
+
+    def discard_pending_login(self, pending_name: str) -> None:
+        """Remove a failed fresh-login root without touching saved profiles."""
+        try:
+            meta = self._load_meta()
+            pending = meta.get("pending_login")
+            name = pending.get("name") if isinstance(pending, dict) else None
+            if not isinstance(name, str):
+                return
+            if name != pending_name:
+                raise SnapshotValidationError("The pending login changed before cleanup")
+            root = (self.desktop_data_dir / name).resolve()
+            if root.parent != self.desktop_data_dir.resolve() or not name.startswith("pending-"):
+                raise SnapshotValidationError("The pending login path is not managed safely")
+            try:
+                self._stop_desktop()
+            except Exception:
+                meta.pop("pending_login", None)
+                self._save_meta(meta)
+                raise
+            meta.pop("pending_login", None)
+            self._save_meta(meta)
+            if root.exists():
+                shutil.rmtree(root)
+        finally:
+            self._clear_decryption_cache()
+
+    def update_profile_usage(
+        self, name: str, usage: dict[str, Any], plan: str = ""
+    ) -> None:
+        """Persist non-secret usage fields; account email remains memory-only."""
+        try:
+            meta = self._load_meta()
+            entry = meta["profiles"].get(name)
+            if not isinstance(entry, dict):
+                raise SnapshotValidationError(f"Profile '{name}' does not exist")
+            safe_usage: dict[str, Any] = {}
+            for bucket in ("five_hour", "seven_day"):
+                value = usage.get(bucket)
+                if isinstance(value, dict):
+                    safe_usage[bucket] = {
+                        key: value.get(key)
+                        for key in ("utilization", "resets_at")
+                        if value.get(key) is not None
+                    }
+            fetched = usage.get("fetched")
+            if isinstance(fetched, (int, float)):
+                safe_usage["fetched"] = float(fetched)
+            entry["usage"] = safe_usage
+            if isinstance(plan, str) and plan.strip():
+                entry["plan"] = plan.strip()[:64]
+            entry.pop("email", None)
+            self._save_meta(meta)
         finally:
             self._clear_decryption_cache()
 

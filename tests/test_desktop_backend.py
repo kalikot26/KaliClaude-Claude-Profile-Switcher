@@ -9,7 +9,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import gui.desktop_backend as desktop_backend
 from gui.desktop_backend import DesktopBackend, DesktopBackendError, ProcessDetectionError, ProfileState
@@ -175,6 +175,8 @@ class IsolatedDesktopTests(unittest.TestCase):
             "switch",
             "launch_active",
             "active_user_data_dir",
+            "discard_pending_login",
+            "update_profile_usage",
         ):
             self.assertTrue(hasattr(self.backend, method), method)
 
@@ -282,6 +284,46 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertNotEqual(first.name, second.name)
         self.assertTrue((first.user_data_dir / "stale-login-marker").is_file())
         self.assertFalse((second.user_data_dir / "stale-login-marker").exists())
+
+    def test_discard_pending_login_removes_only_the_matching_pending_root(self) -> None:
+        pending = self.backend.begin_new_login()
+        (pending.user_data_dir / "partial-login").write_text("fixture", encoding="utf-8")
+
+        self.backend.discard_pending_login(pending.name)
+
+        self.assertFalse(pending.user_data_dir.exists())
+        self.assertNotIn("pending_login", self.meta())
+        self.assertEqual(self.default_root, self.backend.active_user_data_dir())
+
+    def test_discard_pending_login_detaches_metadata_when_shutdown_cannot_be_proven(self) -> None:
+        pending = self.backend.begin_new_login()
+        self.platform.detection_error = True
+
+        with self.assertRaises(ProcessDetectionError):
+            self.backend.discard_pending_login(pending.name)
+
+        self.assertNotIn("pending_login", self.meta())
+        self.assertTrue(pending.user_data_dir.is_dir())
+
+    def test_usage_cache_persists_usage_and_plan_without_email(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+
+        self.backend.update_profile_usage(
+            "alpha",
+            {
+                "five_hour": {"utilization": 10},
+                "seven_day": {"utilization": 20},
+                "fetched": 123.0,
+                "email": "must-not-persist@example.invalid",
+            },
+            "Fixture",
+        )
+
+        entry = self.meta()["profiles"]["alpha"]
+        self.assertEqual(123.0, entry["usage"]["fetched"])
+        self.assertEqual("Fixture", entry["plan"])
+        self.assertNotIn("email", entry)
+        self.assertNotIn("email", entry["usage"])
 
     def test_verify_profile_persists_a_corrupt_config_identity(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
@@ -537,6 +579,7 @@ class LegacyMigrationTests(unittest.TestCase):
         cookies = root / "Network" / "Cookies"
         cookies.parent.mkdir(parents=True, exist_ok=True)
         database = sqlite3.connect(cookies)
+        self.open_databases.append(database)
         if row_in_wal:
             self.assertEqual("wal", database.execute("PRAGMA journal_mode=WAL").fetchone()[0])
         database.execute(
@@ -553,9 +596,9 @@ class LegacyMigrationTests(unittest.TestCase):
         if row_in_wal:
             self.assertTrue((cookies.parent / "Cookies-wal").is_file())
             self.assertTrue((cookies.parent / "Cookies-shm").is_file())
-            self.open_databases.append(database)
         else:
             database.close()
+            self.open_databases.remove(database)
 
     def create_generation(
         self,
@@ -906,17 +949,17 @@ class LegacyMigrationTests(unittest.TestCase):
         source = Path(desktop_backend.__file__).read_text(encoding="utf-8")
         module = ast.parse(source)
         validator = next(
-            node
-            for node in module.body
-            if isinstance(node, ast.ClassDef) and node.name == "DesktopBackend"
-            for node in node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_validate_legacy_cookies"
+            member
+            for klass in module.body
+            if isinstance(klass, ast.ClassDef) and klass.name == "DesktopBackend"
+            for member in klass.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name == "_validate_legacy_cookies"
         )
         forbidden_imports = {"requests", "urllib", "http", "socket", "httpx", "aiohttp"}
         imports = {
             alias.name.split(".", 1)[0]
-            for node in ast.walk(module)
+            for node in ast.walk(validator)
             if isinstance(node, (ast.Import, ast.ImportFrom))
             for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(node.module or "")])
         }
@@ -1032,16 +1075,15 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
     def test_process_detection_never_targets_claude_code(self) -> None:
         desktop = Path(r"C:\\Users\\fixture\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\Claude.exe")
         code = Path(r"C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\Claude.exe")
-        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        adapter = desktop_backend.WindowsDesktopProcessAdapter(platform_name="nt")
         rows = json.dumps(
             [
                 {"ProcessId": 10, "ExecutablePath": str(desktop)},
                 {"ProcessId": 20, "ExecutablePath": str(code)},
             ]
         )
-        with patch.object(desktop_backend.os, "name", "nt"), patch.object(
-            adapter, "_run", return_value=rows
-        ), patch.object(adapter, "_verified_squirrel", return_value=[
+        with patch.object(adapter, "_run", return_value=rows), patch.object(
+            adapter, "_verified_squirrel", return_value=[
             desktop_backend.ExecutableSpec(desktop, "1.0.0", "squirrel")
         ]), patch.object(adapter, "_verified_msix", return_value=[]):
             pids = adapter.desktop_pids()
@@ -1051,16 +1093,15 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
     def test_process_detection_rejects_custom_claude_code_even_with_matching_metadata(self) -> None:
         desktop = Path(r"C:\\Users\\fixture\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\Claude.exe")
         custom_code = Path(r"C:\\Tools\\ClaudeCode\\Claude.exe")
-        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        adapter = desktop_backend.WindowsDesktopProcessAdapter(platform_name="nt")
         rows = json.dumps(
             [
                 {"ProcessId": 10, "ExecutablePath": str(desktop)},
                 {"ProcessId": 20, "ExecutablePath": str(custom_code)},
             ]
         )
-        with patch.object(desktop_backend.os, "name", "nt"), patch.object(
-            adapter, "_run", return_value=rows
-        ), patch.object(adapter, "_verified_squirrel", return_value=[
+        with patch.object(adapter, "_run", return_value=rows), patch.object(
+            adapter, "_verified_squirrel", return_value=[
             desktop_backend.ExecutableSpec(desktop, "1.0.0", "squirrel")
         ]), patch.object(adapter, "_verified_msix", return_value=[]), patch.object(
             adapter, "_valid_product", return_value=True
@@ -1102,10 +1143,12 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
         self.assertEqual([10], unknown)
 
     def test_managed_launcher_invokes_the_verified_executable_directly(self) -> None:
-        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        popen = Mock()
+        popen.return_value.pid = 41
+        adapter = desktop_backend.WindowsDesktopProcessAdapter(launcher=popen)
         executable = desktop_backend.ExecutableSpec(Path(r"C:\\fixture\\Claude.exe"), "1.0.0", "squirrel")
         environment = {"CLAUDE_USER_DATA_DIR": r"C:\\fixture\\profile"}
-        with patch.object(desktop_backend.subprocess, "Popen") as popen:
+        with patch.object(adapter, "_verified_desktop_processes", return_value=[]):
             adapter.launch(executable, environment)
 
         self.assertEqual([str(executable.path)], popen.call_args.args[0])

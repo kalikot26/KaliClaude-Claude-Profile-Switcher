@@ -28,6 +28,12 @@ restore, or replay profile credentials.
 - Claude Desktop installed through a supported Squirrel or Microsoft Store package
 - Python 3 when running from source
 
+Install the source/build dependencies in a clean Python environment:
+
+```powershell
+python -m pip install cryptography pyinstaller
+```
+
 Run from source:
 
 ```powershell
@@ -37,7 +43,7 @@ python gui\app.py
 Build the standalone executable:
 
 ```powershell
-build.bat
+.\build.bat
 ```
 
 The build produces `dist\KaliClaude.exe`. Do not run an unreviewed build against
@@ -91,5 +97,5 @@ handling, lossless migration (including real SQLite WAL/SHM fixtures), AST-enfor
 offline cookie recovery, active-root-only usage, Tk worker marshalling, and safe
 cross-root history sync.
 
-Claude Code account switching is outside Phase 1.1; this release changes Claude
-Desktop profile selection only.
+Claude Code account switching is outside Phase 1.1. Managed Claude Code and
+agent-mode history synchronization remains part of this release.
