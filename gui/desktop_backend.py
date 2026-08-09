@@ -21,7 +21,7 @@ import re
 from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Optional
 
 
@@ -29,6 +29,8 @@ MANIFEST_SCHEMA = 3
 OAUTH_KEY_V1 = "oauth:tokenCache"
 OAUTH_KEY_V2 = "oauth:tokenCacheV2"
 MAX_OPERATIONAL_BACKUPS = 5
+MAX_HISTORY_BACKUPS = 5
+CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
 LEGACY_SESSION_ITEMS = (
     "Session Storage",
     "IndexedDB",
@@ -404,6 +406,7 @@ class DesktopBackend:
         self.profiles_dir = self.cache_dir / "profiles"  # read-only legacy store for Task 2
         self.meta_file = self.cache_dir / "meta.json"
         self.backups_dir = self.cache_dir / "backups"
+        self.history_manifest = self.cache_dir / "cc-sync-manifest.json"
         self._process = process_adapter or WindowsDesktopProcessAdapter()
         self._history_sync = history_sync
         self._oauth_decoder = oauth_decoder
@@ -509,6 +512,11 @@ class DesktopBackend:
     def active_user_data_dir(self) -> Path:
         try:
             meta = self._load_meta()
+            pending = meta.get("pending_login")
+            if isinstance(pending, dict) and isinstance(pending.get("name"), str):
+                pending_root = self.desktop_data_dir / pending["name"]
+                if pending_root.is_dir():
+                    return pending_root
             active = meta.get("desktop_active")
             entry = meta["profiles"].get(active) if isinstance(active, str) else None
             return self._root_for_entry(active, entry) if isinstance(entry, dict) else self.claude_dir
@@ -539,6 +547,7 @@ class DesktopBackend:
             destination = self.desktop_data_dir / name
             if not pending_root.is_dir() or destination.exists() or name in meta["profiles"]:
                 raise SnapshotValidationError("The pending login cannot be finalized safely")
+            self._stop_desktop()
             account_hash = self._read_account_hash(pending_root)
             config = _load_json(pending_root / "config.json")
             os.replace(pending_root, destination)
@@ -712,6 +721,21 @@ class DesktopBackend:
     def launch_active(self) -> LaunchResult:
         try:
             meta = self._load_meta()
+            pending = meta.get("pending_login")
+            if isinstance(pending, dict) and isinstance(pending.get("name"), str):
+                name = pending["name"]
+                root = self.desktop_data_dir / name
+                if not root.is_dir():
+                    return LaunchResult(False, name, root, "The pending login root is missing")
+                executable = self._resolve_executable()
+                try:
+                    verification = self._launch_root(root, executable, set(meta["launch_proofs"]))
+                except Exception as error:
+                    return LaunchResult(False, name, root, str(error) or type(error).__name__)
+                if not verification.already_isolation_verified:
+                    meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
+                    self._save_meta(meta)
+                return LaunchResult(True, name, root)
             name = meta.get("desktop_active")
             if not isinstance(name, str):
                 return LaunchResult(False, message="No Desktop profile is selected")
@@ -764,9 +788,193 @@ class DesktopBackend:
         finally:
             self._clear_decryption_cache()
 
+    @staticmethod
+    def _safe_history_segment(raw: str) -> str:
+        if re.search(r"%[0-9a-fA-F]{2}", raw):
+            raise SnapshotValidationError("History log contains an unsafe encoded path segment")
+        decoded = raw.strip()
+        if (
+            not decoded
+            or decoded in {".", ".."}
+            or "/" in decoded
+            or "\\" in decoded
+            or ":" in decoded
+            or "\x00" in decoded
+            or Path(decoded).is_absolute()
+            or PureWindowsPath(decoded).is_absolute()
+        ):
+            raise SnapshotValidationError("History log contains an unsafe path segment")
+        return decoded
+
+    @staticmethod
+    def _contained_path(root: Path, *segments: str) -> Path:
+        resolved_root = root.resolve()
+        candidate = root.joinpath(*segments).resolve()
+        if candidate != resolved_root and resolved_root not in candidate.parents:
+            raise SnapshotValidationError("History path escapes its managed root")
+        return candidate
+
+    def _managed_history_roots(self) -> list[tuple[Path, str]]:
+        meta = self._load_meta()
+        managed: dict[str, tuple[Path, str]] = {}
+        for name, entry in meta.get("profiles", {}).items():
+            if not isinstance(name, str) or not isinstance(entry, dict) or not self._valid_name(name):
+                continue
+            root = self._root_for_entry(name, entry)
+            if not root.is_dir() or root.is_symlink():
+                continue
+            config = _load_json(root / "config.json")
+            account = config.get("lastKnownAccountUuid")
+            if not isinstance(account, str):
+                continue
+            account = self._safe_history_segment(account)
+            resolved = root.resolve()
+            managed[str(resolved).casefold()] = (resolved, account)
+        return list(managed.values())
+
+    def _history_workspaces(self, root: Path, account: str) -> dict[str, set[str]]:
+        workspaces = {root_name: set() for root_name in CC_SESSION_ROOTS}
+        log = root / "Logs" / "main.log"
+        try:
+            lines = log.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            lower = line.lower()
+            if "persisted sessions from" not in lower and "does not exist yet" not in lower:
+                continue
+            for root_name in CC_SESSION_ROOTS:
+                position = lower.find(root_name.lower())
+                if position < 0:
+                    continue
+                tail = line[position + len(root_name):].lstrip("/\\")
+                segments = [segment for segment in re.split(r"[\\/]", tail) if segment]
+                if len(segments) >= 2:
+                    workspace = self._safe_history_segment(segments[0])
+                    logged_account = self._safe_history_segment(segments[1])
+                    if logged_account == account:
+                        workspaces[root_name].add(workspace)
+                break
+        for root_name in CC_SESSION_ROOTS:
+            history_root = self._contained_path(root, root_name)
+            if not history_root.is_dir() or history_root.is_symlink():
+                continue
+            for workspace_path in history_root.iterdir():
+                if not workspace_path.is_dir() or workspace_path.is_symlink():
+                    continue
+                workspace = self._safe_history_segment(workspace_path.name)
+                account_path = self._contained_path(history_root, workspace, account)
+                if account_path.is_dir() and not account_path.is_symlink():
+                    workspaces[root_name].add(workspace)
+        return workspaces
+
+    def _managed_history_targets(self) -> dict[str, list[tuple[Path, str]]]:
+        roots = self._managed_history_roots()
+        discovered = {root_name: set() for root_name in CC_SESSION_ROOTS}
+        for root, account in roots:
+            for root_name, workspaces in self._history_workspaces(root, account).items():
+                discovered[root_name].update(workspaces)
+        targets = {root_name: [] for root_name in CC_SESSION_ROOTS}
+        for root_name, workspaces in discovered.items():
+            for root, account in roots:
+                for workspace in sorted(workspaces):
+                    folder = self._contained_path(root, root_name, workspace, account)
+                    key = "/".join(
+                        (
+                            _sha256(str(root.resolve())),
+                            root_name,
+                            workspace,
+                            _sha256(account),
+                        )
+                    )
+                    targets[root_name].append((folder, key))
+        return targets
+
+    def _history_json_files(self, folder: Path) -> dict[str, Path]:
+        if not folder.is_dir() or folder.is_symlink():
+            return {}
+        files: dict[str, Path] = {}
+        for path in folder.iterdir():
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".json":
+                continue
+            name = self._safe_history_segment(path.name)
+            files[name] = path
+        return files
+
+    def _backup_managed_histories(self, targets: dict[str, list[tuple[Path, str]]]) -> None:
+        destination = self.backups_dir / f"cc-predelete-{uuid.uuid4().hex}"
+        destination.mkdir(parents=True, exist_ok=False)
+        try:
+            copied = 0
+            for root_name, folders in targets.items():
+                for folder, key in folders:
+                    if folder.is_dir() and not folder.is_symlink():
+                        shutil.copytree(folder, destination / root_name / _sha256(key))
+                        copied += 1
+            if not copied:
+                shutil.rmtree(destination)
+                return
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        old = sorted(
+            (path for path in self.backups_dir.glob("cc-predelete-*") if path.is_dir()),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+        )
+        for obsolete in old[:-MAX_HISTORY_BACKUPS]:
+            shutil.rmtree(obsolete)
+
+    def _sync_histories_local(self) -> dict[str, int]:
+        targets = self._managed_history_targets()
+        manifest = _load_json(self.history_manifest)
+        report = {"added": 0, "removed": 0}
+        deleted: set[str] = set()
+        for folders in targets.values():
+            for folder, key in folders:
+                if not folder.is_dir():
+                    continue
+                current = set(self._history_json_files(folder))
+                previous = manifest.get(key, [])
+                if isinstance(previous, list):
+                    deleted.update(
+                        name for name in previous if isinstance(name, str) and name not in current
+                    )
+        if deleted:
+            self._backup_managed_histories(targets)
+            for folders in targets.values():
+                for folder, _key in folders:
+                    for name in deleted:
+                        safe_name = self._safe_history_segment(name)
+                        path = self._contained_path(folder, safe_name)
+                        if path.is_file() and not path.is_symlink():
+                            path.unlink()
+                            report["removed"] += 1
+
+        new_manifest: dict[str, list[str]] = {}
+        for root_name, folders in targets.items():
+            union: dict[str, Path] = {}
+            for folder, _key in folders:
+                for name, path in self._history_json_files(folder).items():
+                    if name in deleted:
+                        continue
+                    current = union.get(name)
+                    if current is None or path.stat().st_mtime_ns > current.stat().st_mtime_ns:
+                        union[name] = path
+            for folder, key in folders:
+                folder.mkdir(parents=True, exist_ok=True)
+                for name, source in union.items():
+                    destination = self._contained_path(folder, name)
+                    if not destination.exists() or source.stat().st_mtime_ns > destination.stat().st_mtime_ns:
+                        shutil.copy2(source, destination)
+                        report["added"] += 1
+                new_manifest[key] = sorted(union)
+        _atomic_json(self.history_manifest, new_manifest)
+        return report
+
     def sync_histories(self) -> SyncReport:
         try:
-            value = self._history_sync() if self._history_sync is not None else {"added": 0, "removed": 0}
+            self._stop_desktop()
+            value = self._history_sync() if self._history_sync is not None else self._sync_histories_local()
             if isinstance(value, SyncReport):
                 return value
             if isinstance(value, dict):
@@ -1170,6 +1378,54 @@ class DesktopBackend:
         stage.mkdir(parents=True, exist_ok=False)
         return stage
 
+    @staticmethod
+    def _migration_marker(root: Path) -> Path:
+        return root / ".kalikot-migration.json"
+
+    def _write_migration_marker(
+        self,
+        root: Path,
+        name: str,
+        recovered: bool,
+        recovery: Optional[_LegacyRecovery],
+    ) -> None:
+        _atomic_json(
+            self._migration_marker(root),
+            {
+                "schema": MANIFEST_SCHEMA,
+                "kind": "legacy-promotion",
+                "name": name,
+                "recovered": recovered,
+                "account_id_sha256": recovery.account_id_hash if recovered and recovery else "",
+            },
+        )
+
+    def _reusable_promoted_root(
+        self,
+        name: str,
+        recovered: bool,
+        recovery: Optional[_LegacyRecovery],
+    ) -> bool:
+        root = self.desktop_data_dir / name
+        marker = _load_json(self._migration_marker(root))
+        if (
+            not root.is_dir()
+            or root.is_symlink()
+            or marker.get("schema") != MANIFEST_SCHEMA
+            or marker.get("kind") != "legacy-promotion"
+            or marker.get("name") != name
+            or marker.get("recovered") is not recovered
+        ):
+            return False
+        if not recovered:
+            return True
+        if recovery is None or marker.get("account_id_sha256") != recovery.account_id_hash:
+            return False
+        try:
+            return self._read_account_hash(root) == recovery.account_id_hash
+        except SnapshotValidationError:
+            return False
+
     def audit_and_migrate(self) -> MigrationReport:
         """Losslessly recover schema-2 profiles into isolated schema-3 roots."""
         previous_decryption_root = self._decryption_root
@@ -1239,26 +1495,30 @@ class DesktopBackend:
                     if generation is not None
                     else None
                 )
-                stage = self._new_isolated_stage(name)
-                recovered = False
-                try:
-                    if generation is not None and recovery is not None:
-                        try:
-                            self._seed_recovered_root(stage, generation, recovery, hashes)
-                            recovered = True
-                        except SnapshotValidationError:
-                            shutil.rmtree(stage)
-                            stage = self._new_isolated_stage(name)
+                recovered = generation is not None and recovery is not None
+                if not self._reusable_promoted_root(name, recovered, recovery):
+                    stage = self._new_isolated_stage(name)
+                    recovered = False
+                    try:
+                        if generation is not None and recovery is not None:
+                            try:
+                                self._seed_recovered_root(stage, generation, recovery, hashes)
+                                recovered = True
+                            except SnapshotValidationError:
+                                shutil.rmtree(stage)
+                                stage = self._new_isolated_stage(name)
+                                self._seed_clean_root(stage, hashes)
+                        else:
                             self._seed_clean_root(stage, hashes)
-                    else:
-                        self._seed_clean_root(stage, hashes)
-                    self._promote_isolated_stage(name, stage)
-                except Exception:
-                    if stage.exists():
-                        quarantine = self.desktop_data_dir / ".quarantine"
-                        quarantine.mkdir(parents=True, exist_ok=True)
-                        os.replace(stage, quarantine / f"{name}-failed-{uuid.uuid4().hex}")
-                    raise
+                        self._write_migration_marker(stage, name, recovered, recovery)
+                        self._promote_isolated_stage(name, stage)
+                        self._fault_hook(f"migration:promoted:{name}")
+                    except Exception:
+                        if stage.exists():
+                            quarantine = self.desktop_data_dir / ".quarantine"
+                            quarantine.mkdir(parents=True, exist_ok=True)
+                            os.replace(stage, quarantine / f"{name}-failed-{uuid.uuid4().hex}")
+                        raise
 
                 if recovered and recovery is not None and generation is not None:
                     migrated_entry.update(

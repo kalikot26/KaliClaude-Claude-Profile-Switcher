@@ -405,6 +405,87 @@ class IsolatedDesktopTests(unittest.TestCase):
         with self.assertRaises(ProcessDetectionError):
             backend.desktop_pids()
 
+    def _write_history_log(self, root: Path, workspace: str, account: str) -> None:
+        log = root / "Logs" / "main.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            f"persisted sessions from C:\\fixture\\claude-code-sessions\\{workspace}\\{account}\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_history(root: Path, workspace: str, account: str, name: str, value: str) -> Path:
+        path = root / "claude-code-sessions" / workspace / account / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+        return path
+
+    def test_history_sync_closes_desktop_and_merges_only_managed_roots(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        alpha = self.cache / "desktop-data" / "alpha"
+        beta = self.cache / "desktop-data" / "beta"
+        self._write_history_log(alpha, "workspace", "uuid-a")
+        self._write_history_log(beta, "workspace", "uuid-b")
+        self._write_history(alpha, "workspace", "uuid-a", "alpha.json", "alpha")
+        self._write_history(beta, "workspace", "uuid-b", "beta.json", "beta")
+        self.platform.pids = [101]
+
+        report = self.backend.sync_histories()
+
+        self.assertTrue(report.ok, report.message)
+        self.assertEqual([], self.platform.pids)
+        self.assertEqual([101], self.platform.closed)
+        for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
+            folder = root / "claude-code-sessions" / "workspace" / account
+            self.assertEqual({"alpha.json", "beta.json"}, {path.name for path in folder.glob("*.json")})
+
+    def test_history_sync_rejects_encoded_traversal_segments(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        alpha = self.cache / "desktop-data" / "alpha"
+        self._write_history_log(alpha, "%2e%2e", "uuid-a")
+        outside = self.cache / "desktop-data" / "outside.json"
+        outside.write_text("unchanged", encoding="utf-8")
+
+        report = self.backend.sync_histories()
+
+        self.assertFalse(report.ok)
+        self.assertIn("unsafe", report.message.lower())
+        self.assertEqual("unchanged", outside.read_text(encoding="utf-8"))
+
+    def test_history_deletion_is_scoped_to_explicit_managed_account_directories(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        alpha = self.cache / "desktop-data" / "alpha"
+        beta = self.cache / "desktop-data" / "beta"
+        for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
+            self._write_history_log(root, "workspace", account)
+        source = self._write_history(alpha, "workspace", "uuid-a", "removed.json", "managed")
+        self.assertTrue(self.backend.sync_histories().ok)
+        unrelated = beta / "claude-code-sessions" / "unmanaged" / "other-account" / "removed.json"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("unmanaged", encoding="utf-8")
+        source.unlink()
+
+        report = self.backend.sync_histories()
+
+        self.assertTrue(report.ok, report.message)
+        self.assertGreaterEqual(report.removed, 1)
+        self.assertTrue(unrelated.is_file())
+        self.assertEqual("unmanaged", unrelated.read_text(encoding="utf-8"))
+
+    def test_history_failure_is_nonfatal_to_stopped_profile_switch(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        self.backend._history_sync = lambda: (_ for _ in ()).throw(OSError("fixture history failure"))
+
+        result = self.backend.switch("alpha")
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(result.history)
+        self.assertFalse(result.history.ok)
+        self.assertEqual("alpha", self.meta()["desktop_active"])
+
 
 class LegacyMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -694,6 +775,37 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertEqual(isolated_before, file_digest(self.cache / "desktop-data" / "alpha"))
         self.assertEqual(legacy_before, file_digest(legacy))
         self.assertEqual(["alpha"], second.unchanged)
+
+    def test_restart_reuses_promoted_root_after_crash_before_schema_three_commit(self) -> None:
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+
+        def crash_after_promotion(step: str) -> None:
+            if step == "migration:promoted:alpha":
+                raise RuntimeError("fixture crash")
+
+        self.backend._fault_hook = crash_after_promotion
+        with self.assertRaisesRegex(RuntimeError, "fixture crash"):
+            self.backend.audit_and_migrate()
+        promoted = self.cache / "desktop-data" / "alpha"
+        promoted_before = file_digest(promoted)
+
+        restarted = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=FakePlatform(),
+            oauth_decoder=self.decode_oauth,
+            cookie_decoder=self.decode_cookie,
+        )
+        report = restarted.audit_and_migrate()
+
+        self.assertEqual(["alpha"], report.migrated)
+        self.assertEqual(promoted_before, file_digest(promoted))
+        quarantine = self.cache / "desktop-data" / ".quarantine"
+        self.assertEqual([], list(quarantine.glob("alpha-*")) if quarantine.exists() else [])
 
     def test_operational_backup_cap_preserves_all_legacy_session_backups(self) -> None:
         backups = self.cache / "backups"

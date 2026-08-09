@@ -1,8 +1,8 @@
-"""KaliClaude — validated, transactional Claude Desktop profile switching.
+"""KaliClaude — isolated Claude Desktop profile switching.
 
-The GUI delegates profile auditing, schema-2 session snapshots, process-safe
-switching, and rollback to desktop_backend. The optional usage action reads only
-the active live session; saved profile cookies are never sent over the network.
+The backend owns profile roots, managed launches, migration, and process safety.
+The optional usage action reads only the selected active root; inactive profile
+cookies are never enumerated or replayed.
 """
 from __future__ import annotations
 
@@ -11,10 +11,8 @@ import gzip
 import json
 import os
 import queue
-import shutil
 import socket
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -81,14 +79,7 @@ def _res(name: str) -> Path:
 ICON_PATH  = _res("app.ico")
 
 CACHE_DIR  = Path.home() / ".kalikot-claude-switcher"
-STORE_DIR  = CACHE_DIR / "profiles"     # <name>/  per-profile session snapshot
-META_FILE  = CACHE_DIR / "meta.json"    # {active, aumid, profiles:{...}}
-
-CLAUDE_DIR    = Path.home() / "AppData" / "Roaming" / "Claude"
-CLAUDE_CONFIG = CLAUDE_DIR / "config.json"
-LOCAL_STATE   = CLAUDE_DIR / "Local State"   # holds the os_crypt AES key
-OAUTH_KEY     = "oauth:tokenCache"
-OAUTH_KEY_V2  = "oauth:tokenCacheV2"   # Claude Desktop migrated the live token cache here
+META_FILE  = CACHE_DIR / "meta.json"
 
 MUTEX_NAME = "Local\\KaliClaudeProfileSwitcherV2"
 IPC_HOST   = "127.0.0.1"
@@ -104,118 +95,10 @@ def _load_json(p: Path) -> dict:
     except Exception:
         return {}
 
-def _save_json(p: Path, d: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
-
 def _load_meta() -> dict:
     m = _load_json(META_FILE)
-    m.setdefault("active", None)
-    m.setdefault("aumid", None)
     m.setdefault("profiles", {})
     return m
-
-def _save_meta(m: dict) -> None:
-    _save_json(META_FILE, m)
-
-# ---------------------------------------------------------------------------
-# Claude config (the live session lives here)
-# ---------------------------------------------------------------------------
-
-def _read_config() -> Optional[dict]:
-    """Parse Claude Desktop config.json. None if missing/unreadable."""
-    if not CLAUDE_CONFIG.exists():
-        return None
-    try:
-        return json.loads(CLAUDE_CONFIG.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _live_blob() -> Optional[str]:
-    """The live oauth token blob for the signed-in account, and the SINGLE source
-    of truth for the live token everywhere (capture, restore, backup, fingerprint,
-    presence, usage). Claude Desktop migrated the active token to
-    `oauth:tokenCacheV2` and left the legacy `oauth:tokenCache` empty, so prefer
-    V2 and fall back to the legacy key for older Claude builds. Nothing should read
-    the raw legacy key directly, or it will pick up the dead/empty blob."""
-    cfg = _read_config()
-    if not cfg:
-        return None
-    for key in (OAUTH_KEY_V2, OAUTH_KEY):
-        blob = cfg.get(key)
-        if isinstance(blob, str) and blob:
-            return blob
-    return None
-
-# ---------------------------------------------------------------------------
-# Profile-path helpers for explicit Rename/Remove UI actions. All snapshot
-# capture, validation, restoration, and history sync live in desktop_backend.py.
-# ---------------------------------------------------------------------------
-
-def _profile_dir(name: str) -> Path:
-    return STORE_DIR / name
-
-def _retained_profile_generations(name: str) -> list[Path]:
-    root = STORE_DIR / ".previous"
-    prefix = f"{name}-"
-    if not root.is_dir():
-        return []
-    return [
-        path
-        for path in root.iterdir()
-        if path.is_dir()
-        and path.name.startswith(prefix)
-        and len(path.name[len(prefix):]) == 20
-        and path.name[len(prefix):].isdigit()
-    ]
-
-def _rename_profile_store(old_name: str, new_name: str) -> None:
-    moves: list[tuple[Path, Path]] = []
-    old_prefix = f"{old_name}-"
-    for generation in sorted(_retained_profile_generations(old_name)):
-        stamp = generation.name[len(old_prefix):]
-        moves.append((generation, generation.with_name(f"{new_name}-{stamp}")))
-    legacy = STORE_DIR / f"{old_name}.blob"
-    if legacy.exists():
-        moves.append((legacy, STORE_DIR / f"{new_name}.blob"))
-    current = _profile_dir(old_name)
-    if current.exists():
-        moves.append((current, _profile_dir(new_name)))
-
-    for _source, destination in moves:
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError(f"Profile storage already exists at {destination}")
-
-    moved: list[tuple[Path, Path]] = []
-    try:
-        for source, destination in moves:
-            os.replace(source, destination)
-            moved.append((source, destination))
-    except OSError as error:
-        rollback_errors: list[str] = []
-        for source, destination in reversed(moved):
-            try:
-                os.replace(destination, source)
-            except OSError as rollback_error:
-                rollback_errors.append(str(rollback_error))
-        if rollback_errors:
-            raise OSError(
-                f"Profile rename failed and could not be fully rolled back: "
-                f"{'; '.join(rollback_errors)}"
-            ) from error
-        raise
-
-def _delete_profile_store(name: str) -> None:
-    for generation in _retained_profile_generations(name):
-        shutil.rmtree(generation)
-    legacy = STORE_DIR / f"{name}.blob"
-    if legacy.exists():
-        legacy.unlink()
-    d = _profile_dir(name)
-    if d.exists():
-        shutil.rmtree(d)
 
 def _valid_name(name: str) -> bool:
     return bool(name) and len(name) <= 32 and all(
@@ -237,9 +120,6 @@ try:
 except Exception:
     _CRYPTO_OK = False
 
-_aes_key_cache: Optional[bytes] = None
-
-
 def _dpapi_unprotect(data: bytes) -> bytes:
     import ctypes
     from ctypes import wintypes
@@ -260,16 +140,12 @@ def _dpapi_unprotect(data: bytes) -> bytes:
     return buf.raw
 
 
-def _os_crypt_key() -> bytes:
-    global _aes_key_cache
-    if _aes_key_cache:
-        return _aes_key_cache
-    ls = json.loads(LOCAL_STATE.read_text(encoding="utf-8"))
+def _os_crypt_key(user_data_dir: Path) -> bytes:
+    ls = json.loads((user_data_dir / "Local State").read_text(encoding="utf-8"))
     ek = base64.b64decode(ls["os_crypt"]["encrypted_key"])
     if ek[:5] != b"DPAPI":
         raise ValueError("unexpected os_crypt key prefix")
-    _aes_key_cache = _dpapi_unprotect(ek[5:])
-    return _aes_key_cache
+    return _dpapi_unprotect(ek[5:])
 
 
 _DESKTOP_BACKEND: Optional[DesktopBackend] = None
@@ -298,13 +174,13 @@ _CLAUDE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
-def _cookies_from_db(db) -> Optional[str]:
+def _cookies_from_db(db: Path, user_data_dir: Path) -> Optional[str]:
     """Decrypt claude.ai cookies from ONE Cookies SQLite file into a Cookie header.
     Returns None if the file is missing / locked / has no sessionKey."""
     if not db or not db.exists():
         return None
     try:
-        key = _os_crypt_key()
+        key = _os_crypt_key(user_data_dir)
         con = sqlite3.connect(f"file:{db.as_posix()}?immutable=1", uri=True)
     except Exception:
         return None    # exclusively locked (the live file while Claude runs) or unreadable
@@ -332,18 +208,18 @@ def _cookies_from_db(db) -> Optional[str]:
     return "; ".join(f"{k}={v}" for k, v in jar.items())
 
 
-def _claude_cookie_header() -> Optional[str]:
+def _claude_cookie_header(user_data_dir: Path) -> Optional[str]:
     """claude.ai cookies as a Cookie header — the LIVE session ONLY.
 
     SAFETY (do not "improve" this): never fall back to a profile SNAPSHOT's cookies.
-    A snapshot can hold a SUPERSEDED sessionKey (claude.ai rotates it), and sending a
+    An inactive root can hold a SUPERSEDED sessionKey (claude.ai rotates it), and sending a
     rotated-away session token is indistinguishable from a stolen-session replay — the
     server's response is to REVOKE the account's sessions. That killed live sessions.
     Only the current live cookie is safe to send, and it is only readable while Claude
     Desktop is closed (it holds an exclusive lock on the file)."""
     if not _CRYPTO_OK:
         return None
-    return _cookies_from_db(CLAUDE_DIR / "Network" / "Cookies")
+    return _cookies_from_db(user_data_dir / "Network" / "Cookies", user_data_dir)
 
 
 def _claude_web_get(path: str, cookie: str, timeout: int = 15) -> dict:
@@ -388,15 +264,15 @@ def _norm_metric(m) -> Optional[dict]:
     return {"utilization": util, "resets_at": reset}
 
 
-def _usage_via_cookies() -> dict:
+def _usage_via_cookies(user_data_dir: Path) -> dict:
     """Read usage via the live claude.ai session cookie — no OAuth-token call."""
-    cookie = _claude_cookie_header()
+    cookie = _claude_cookie_header(user_data_dir)
     if not cookie:
         return {"_error":
                 "Can't read the live session while Claude Desktop is running — it "
                 "holds an exclusive lock on the cookie file.\n\n"
                 "Click 'Stop Claude', then Refresh Usage, then Launch Claude again.\n\n"
-                "(We deliberately never fall back to a saved snapshot's cookie: that "
+                "(We deliberately never fall back to an inactive profile cookie: that "
                 "key may be superseded, and replaying it makes the server revoke your "
                 "session.)"}
     orgs = _claude_web_get("/api/organizations", cookie)
@@ -408,7 +284,7 @@ def _usage_via_cookies() -> dict:
         return {"_error": "No organizations for this session."}
     want = None
     try:
-        want = json.loads(CLAUDE_CONFIG.read_text("utf-8")).get("lastKnownAccountUuid")
+        want = json.loads((user_data_dir / "config.json").read_text("utf-8")).get("lastKnownAccountUuid")
     except Exception:
         pass
     org = next((o for o in org_list if want and want in json.dumps(o)), org_list[0])
@@ -480,41 +356,6 @@ def _until_str(iso: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Claude Desktop process control
-# ---------------------------------------------------------------------------
-
-_NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-
-def _desktop_claude_pids() -> list:
-    """PIDs of Claude Desktop only; UI polling treats detection errors as unknown."""
-    try:
-        return _desktop_backend().desktop_pids()
-    except Exception:
-        return []
-
-def _claude_running() -> bool:
-    return len(_desktop_claude_pids()) > 0
-
-def _kill_claude() -> None:
-    _desktop_backend().stop_desktop()
-
-def _detect_aumid() -> Optional[str]:
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-StartApps | Where-Object { $_.Name -match 'Claude' } "
-             "| Select-Object -First 1).AppID"],
-            capture_output=True, text=True, timeout=12, creationflags=_NOWIN)
-        a = (r.stdout or "").strip()
-        return a or None
-    except Exception:
-        return None
-
-def _launch_claude(aumid: Optional[str]) -> None:
-    target = aumid or "Claude_pzs8sxrjxfjjc!Claude"
-    subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{target}"],
-                     creationflags=_NOWIN)
-
 # ---------------------------------------------------------------------------
 # Single-instance
 # ---------------------------------------------------------------------------
@@ -583,6 +424,7 @@ class Profile:
 PROFILE_STATE_LABELS = {
     ProfileState.ACTIVE: "Active",
     ProfileState.READY: "Ready",
+    ProfileState.NEEDS_VALIDATION: "Needs validation",
     ProfileState.NEEDS_RELOGIN: "Needs re-login",
     ProfileState.CORRUPT: "Corrupt",
     ProfileState.UNKNOWN_LIVE_LOGIN: "Unknown live login",
@@ -594,7 +436,11 @@ def _list_profiles() -> list[Profile]:
     for saved in _desktop_backend().list_profiles():
         name = saved.name
         info = m.get("profiles", {}).get(name, {})
-        ready = saved.state in (ProfileState.ACTIVE, ProfileState.READY)
+        ready = saved.state in (
+            ProfileState.ACTIVE,
+            ProfileState.READY,
+            ProfileState.NEEDS_VALIDATION,
+        )
         out.append(Profile(
             name=name,
             label=saved.label,
@@ -690,8 +536,6 @@ class App:
         self.root.after(1500, self._tick)
         self.root.after(150, self._pump)
         self.root.after(350, self._show_startup_audit)
-        # detect & cache AUMID in background
-        threading.Thread(target=self._ensure_aumid, daemon=True).start()
 
     def _show_startup_audit(self):
         if self._startup_error:
@@ -708,20 +552,25 @@ class App:
             backup = f"\n\nRecovery backup:\n{report.backup.path}" if report.backup else ""
             messagebox.showwarning(
                 "Profiles Need Attention",
-                "The profile audit preserved but blocked these snapshots:\n\n"
+                "The profile audit preserved but blocked these profiles:\n\n"
                 + "\n".join(f"• {name}" for name in blocked)
-                + "\n\nSign in again and use Update Snapshot for each blocked profile."
+                + "\n\nPrepare and save a fresh isolated login for each blocked profile."
                 + backup,
                 parent=self.root,
             )
 
-    def _ensure_aumid(self):
-        m = _load_meta()
-        if not m.get("aumid"):
-            a = _detect_aumid()
-            if a:
-                m["aumid"] = a
-                _save_meta(m)
+    def _action_ready(self, *, require_selection: bool = False) -> bool:
+        if self._startup_error:
+            messagebox.showerror(
+                "Profile Audit Failed",
+                "Profile actions remain disabled because startup audit failed.\n\n"
+                + self._startup_error,
+                parent=self.root,
+            )
+            return False
+        if self._busy or self._usage_busy:
+            return False
+        return not require_selection or 0 <= self._sel < len(self._profiles)
 
     def _focus(self):
         self.root.deiconify(); self.root.lift(); self.root.focus_force()
@@ -773,12 +622,15 @@ class App:
         right.pack(side=tk.RIGHT, padx=16, pady=12)
         self._btn_refresh = _btn(right, "Refresh", self._refresh, bg=BG_CARD)
         self._btn_refresh.pack(side=tk.RIGHT, padx=(6, 0))
-        _btn(right, "Save Current Login", self._on_save_current,
-             accent=True).pack(side=tk.RIGHT, padx=(6, 0))
-        _btn(right, "Prepare New Login", self._on_prepare_login,
-             bg=BG_CARD).pack(side=tk.RIGHT, padx=(6, 0))
-        _btn(right, "Sync History", self._on_sync_histories,
-             bg=BG_CARD).pack(side=tk.RIGHT)
+        self._btn_save = _btn(right, "Save Current Login", self._on_save_current,
+                              accent=True)
+        self._btn_save.pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn_prepare = _btn(right, "Prepare New Login", self._on_prepare_login,
+                                 bg=BG_CARD)
+        self._btn_prepare.pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn_sync = _btn(right, "Sync History", self._on_sync_histories,
+                              bg=BG_CARD)
+        self._btn_sync.pack(side=tk.RIGHT)
 
     def _build_sidebar(self, parent):
         sb = tk.Frame(parent, bg=BG_SIDEBAR, width=240)
@@ -813,7 +665,7 @@ class App:
             self._panel,
             text="No profile selected\n\n"
                  "Log into Claude, then click  'Save Current Login'\n"
-                 "to capture this session as a profile.",
+                 "to finalize it as an isolated profile.",
             bg=BG_PANEL, fg=TXT_MUTE, font=(FF, 11), justify=tk.CENTER)
         self._empty.place(relx=0.5, rely=0.42, anchor="center")
 
@@ -834,7 +686,7 @@ class App:
         meta.pack(fill=tk.X, padx=32, pady=(0, 4))
         self._email_row = self._meta_row(meta, "Email")
         self._plan_row  = self._meta_row(meta, "Plan")
-        self._saved_row = self._meta_row(meta, "Snapshot")
+        self._saved_row = self._meta_row(meta, "Login state")
 
         tk.Frame(self._content, bg=CLR_DIV, height=1).pack(
             fill=tk.X, padx=32, pady=(10, 10))
@@ -877,7 +729,7 @@ class App:
         self._btn_switch = _btn(act, "Switch to this Profile",
                                 self._on_switch, accent=True)
         self._btn_switch.pack(side=tk.LEFT, padx=(0, 8))
-        self._btn_update = _btn(act, "Update Snapshot", self._on_update)
+        self._btn_update = _btn(act, "Verify Login", self._on_update)
         self._btn_update.pack(side=tk.LEFT, padx=(0, 8))
         self._btn_rename = _btn(act, "Rename", self._on_rename)
         self._btn_rename.pack(side=tk.LEFT, padx=(0, 8))
@@ -886,8 +738,8 @@ class App:
 
         hint = tk.Label(
             self._content,
-            text="“Update Snapshot” re-captures the current login into this "
-                 "profile (use after a long session to keep its token fresh).",
+            text="“Verify Login” checks this profile's persistent isolated root; "
+                 "no session snapshot is copied or replaced.",
             bg=BG_PANEL, fg=TXT_MUTE, font=(FF, 8), justify=tk.LEFT,
             wraplength=460, anchor="w")
         hint.pack(fill=tk.X, padx=32, pady=(2, 14))
@@ -956,7 +808,7 @@ class App:
         self._count_lbl.configure(text=f"PROFILES  ·  {n}" if n else "PROFILES")
         if not n:
             tk.Label(self._inner,
-                     text="No saved sessions yet\n\nLog into Claude, then\n"
+                     text="No saved profiles yet\n\nPrepare a new login, sign in, then\n"
                           "'Save Current Login'",
                      bg=BG_SIDEBAR, fg=TXT_MUTE, font=(FF, 9),
                      justify=tk.CENTER, pady=40).pack(fill=tk.X, padx=10)
@@ -1043,10 +895,13 @@ class App:
         self._saved_row.configure(
             text=snapshot_text,
             fg=TXT_SUB if p.has_blob else CLR_WARN)
+        self._note.configure(state=tk.NORMAL)
         self._note.delete("1.0", tk.END); self._note.insert("1.0", p.note)
+        self._note.configure(state=tk.DISABLED)
         self._note_saved.configure(text="")
         self._render_usage(p)
 
+        actions_enabled = not self._startup_error
         if p.is_active:
             self._btn_switch.configure(text="Active Now", state=tk.DISABLED,
                                        bg=BG_CARD, fg=TXT_MUTE,
@@ -1059,11 +914,14 @@ class App:
             self._btn_switch.configure(text="Switch to this Profile",
                                        state=tk.NORMAL, bg=CLR_ACCENT,
                                        fg="#17140F", activebackground="#BF6330")
-        self._update_btn = getattr(self, "_btn_update", None)
+        if not actions_enabled:
+            self._btn_switch.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
         self._btn_update.configure(
-            state=tk.NORMAL if self._live_present else tk.DISABLED,
-            bg=BG_CARD if self._live_present else BG_CARD,
-            fg=TXT_PRI if self._live_present else TXT_MUTE)
+            state=tk.NORMAL if actions_enabled else tk.DISABLED,
+            bg=BG_CARD,
+            fg=TXT_PRI if actions_enabled else TXT_MUTE)
+        self._btn_rename.configure(state=tk.DISABLED, fg=TXT_MUTE)
+        self._btn_remove.configure(state=tk.DISABLED, fg=TXT_MUTE)
         self._refresh_claude_ui()
 
     def _render_usage(self, p: Profile):
@@ -1105,7 +963,11 @@ class App:
             text="Refresh Usage")
 
     def _refresh_claude_ui(self):
-        if self._claude_detection_error:
+        if self._startup_error:
+            self._claude_lbl.configure(text="⚠ Profile audit failed", fg=CLR_ERR)
+            self._btn_launch.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
+            self._btn_stop.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
+        elif self._claude_detection_error:
             self._claude_lbl.configure(text="⚠ Claude status unavailable", fg=CLR_WARN)
             self._btn_launch.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
             self._btn_stop.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
@@ -1121,6 +983,16 @@ class App:
     # ----- refresh / polling ------------------------------------------------
 
     def _refresh(self):
+        if self._startup_error:
+            self._profiles = []
+            for button in (self._btn_save, self._btn_prepare, self._btn_sync):
+                button.configure(state=tk.DISABLED)
+            self._render_list()
+            self._show_detail(None)
+            self._set_status("Profile audit failed — actions disabled")
+            return
+        for button in (self._btn_save, self._btn_prepare, self._btn_sync):
+            button.configure(state=tk.NORMAL)
         self._profiles = _list_profiles()
         if self._sel >= len(self._profiles):
             self._sel = len(self._profiles) - 1
@@ -1129,27 +1001,23 @@ class App:
                           if 0 <= self._sel < len(self._profiles) else None)
         active = next((p.name for p in self._profiles if p.is_active), None)
         n = len(self._profiles)
-        live_status = (
-            f"  ·  Active: {active}"
-            if active
-            else ("  ·  Unknown live login" if _live_blob() else "")
-        )
+        live_status = f"  ·  Active: {active}" if active else ""
         self._set_status(f"{n} profile{'s' if n != 1 else ''}" + live_status)
 
     def _tick(self):
         def check():
             try:
                 up = _desktop_backend().desktop_running()
-                detection_error = False
             except Exception:
-                up = False
-                detection_error = True
-            live = _live_blob() is not None
-            self.root.after(
-                0, lambda: self._apply_tick(up, live, detection_error)
-            )
+                self._q.put(("tick", (False, False, True)))
+                return
+            try:
+                root = _desktop_backend().active_user_data_dir()
+                live = bool(_load_json(root / "config.json").get("lastKnownAccountUuid"))
+            except Exception:
+                live = False
+            self._q.put(("tick", (up, live)))
         threading.Thread(target=check, daemon=True).start()
-        self.root.after(5000, self._tick)
 
     def _apply_tick(self, up, live, detection_error=False):
         self._claude_up = up
@@ -1162,8 +1030,8 @@ class App:
             self._refresh_claude_ui()
             if 0 <= self._sel < len(self._profiles):
                 self._btn_update.configure(
-                    state=tk.NORMAL if live else tk.DISABLED,
-                    fg=TXT_PRI if live else TXT_MUTE)
+                    state=tk.NORMAL if not self._startup_error else tk.DISABLED,
+                    fg=TXT_PRI if not self._startup_error else TXT_MUTE)
 
     # ----- selection --------------------------------------------------------
 
@@ -1188,7 +1056,7 @@ class App:
         # itself uses — indistinguishable from normal usage. We never read a
         # non-active profile's stored token, which is the cross-account pattern
         # that could look anomalous. Non-active profiles show their last cache.
-        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if not self._action_ready(require_selection=True):
             return
         if not _CRYPTO_OK:
             messagebox.showwarning(
@@ -1215,7 +1083,8 @@ class App:
                 # Cookie-authed read against claude.ai (NOT the OAuth token against
                 # api.anthropic.com) — this is what the app's web UI does, so it
                 # never trips the token-anomaly revocation that was logging you out.
-                u = _usage_via_cookies()
+                active_root = _desktop_backend().active_user_data_dir()
+                u = _usage_via_cookies(active_root)
                 if "_http_error" in u or "_error" in u:
                     self._q.put(("usage_err",
                                  (name, u.get("_error")
@@ -1237,14 +1106,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_save_current(self):
-        if self._busy or self._usage_busy:
-            return
-        if not _live_blob():
-            messagebox.showwarning(
-                "Not Logged In",
-                "No active Claude session was found.\n\n"
-                "Log into Claude Desktop first, then click "
-                "'Save Current Login'.", parent=self.root)
+        if not self._action_ready():
             return
         existing = [p.name for p in self._profiles]
         dlg = SaveDialog(self.root, existing)
@@ -1254,9 +1116,9 @@ class App:
         name, label, note = dlg.result
         if not messagebox.askyesno(
             "Save Current Login",
-            f"Capture the current login as profile '{name}'.\n\n"
-            "Claude will be closed briefly to copy the session cleanly (a live "
-            "copy would be locked/incomplete), then you can reopen it. Continue?",
+            f"Finalize the pending isolated login as profile '{name}'?\n\n"
+            "Claude Desktop will close so the pending root can be named safely. "
+            "No existing profile root is copied or replaced.",
             parent=self.root):
             return
 
@@ -1265,7 +1127,7 @@ class App:
 
         def work():
             try:
-                _desktop_backend().capture_current(name, label, note)
+                _desktop_backend().finalize_current(name, label, note)
                 self._q.put(("save_ok", name))
             except Exception as e:
                 self._q.put(("save_err", str(e)))
@@ -1273,20 +1135,13 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update(self):
-        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if not self._action_ready(require_selection=True):
             return
         p = self._profiles[self._sel]
-        if not _live_blob():
-            messagebox.showwarning("Not Logged In",
-                                   "No active Claude session to capture.",
-                                   parent=self.root)
-            return
         if not messagebox.askyesno(
-            "Update Snapshot",
-            f"Re-capture the CURRENT login into profile '{p.name}'?\n\n"
-            "Use this only if the current login belongs to this profile.\n"
-            "Claude will be closed briefly to copy the session cleanly, then you "
-            "can reopen it. Continue?",
+            "Verify Login",
+            f"Verify the persistent isolated login for profile '{p.name}'?\n\n"
+            "This checks the stored account identity without copying session data.",
             parent=self.root):
             return
         name = p.name
@@ -1295,15 +1150,15 @@ class App:
 
         def work():
             try:
-                _desktop_backend().capture_current(name, p.label, p.note)
-                self._q.put(("save_ok", name))
+                _desktop_backend().verify_profile(name)
+                self._q.put(("verify_ok", name))
             except Exception as e:
-                self._q.put(("save_err", str(e)))
+                self._q.put(("verify_err", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_switch(self):
-        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if not self._action_ready(require_selection=True):
             return
         p = self._profiles[self._sel]
         if p.is_active:
@@ -1311,9 +1166,8 @@ class App:
         if not p.has_blob:
             self._on_relogin_profile(p)
             return
-        running = _claude_running()
         msg = f"Switch Claude to profile  '{p.name}'?"
-        if running:
+        if self._claude_up:
             msg += "\n\nClaude is running and will be closed first."
         if not messagebox.askyesno("Switch Profile", msg, parent=self.root):
             return
@@ -1339,43 +1193,23 @@ class App:
         reason = f"\n\nReason: {profile.issue}" if profile.issue else ""
         if messagebox.askyesno(
             "Re-login Required",
-            f"'{profile.name}' cannot be restored because its saved login is "
+            f"'{profile.name}' cannot be selected because its saved login is "
             f"incomplete or invalid.{reason}\n\nPrepare a fresh Claude login now? After "
-            "signing in, select this profile and click 'Update Snapshot'.",
+            "signing in, save the pending login as a new profile.",
             parent=self.root,
         ):
             self._on_prepare_login()
 
     def _on_prepare_login(self):
-        """Capture the current session (optional), then CLEAR the live web
-        session + token so Claude shows a genuine fresh login screen. Saved
-        profiles remain valid and restorable."""
-        if self._busy or self._usage_busy:
+        """Create and managed-launch a fresh isolated Desktop root."""
+        if not self._action_ready():
             return
-        save_req = None
-        already_saved = any(p.is_active and p.has_blob for p in self._profiles)
-        # Only offer to save the current login if it isn't already captured
-        # (e.g. you just used "Save Current Login"). No nagging otherwise.
-        if _live_blob() and not already_saved:
-            if messagebox.askyesno(
-                "Save Current First?",
-                "The current login isn't saved as a profile yet.\n\n"
-                "Save it before preparing a new one, so you can switch back?",
-                parent=self.root):
-                existing = [p.name for p in self._profiles]
-                dlg = SaveDialog(self.root, existing)
-                self.root.wait_window(dlg.top)
-                if dlg.result:
-                    save_req = dlg.result   # (name, label, note)
 
         if not messagebox.askyesno(
             "Prepare New Login",
-            "This closes Claude and CLEARS the active web session so you can "
-            "sign in with a DIFFERENT account.\n\n"
-            "• Your saved profiles are NOT affected — they stay restorable.\n"
-            "• The current session is backed up first.\n\n"
-            "After Claude reopens you'll see a fresh login screen. Sign in, "
-            "then click 'Save Current Login'.\n\nContinue?",
+            "Create a fresh isolated Claude Desktop root and open it for a new "
+            "login?\n\nYour active and saved profile roots are not cleared, copied, "
+            "or rewritten. After signing in, click 'Save Current Login'.",
             parent=self.root):
             return
 
@@ -1384,13 +1218,15 @@ class App:
 
         def work():
             try:
-                if save_req:
-                    sname, slabel, snote = save_req
-                    _desktop_backend().capture_current(sname, slabel, snote)
-                backup = _desktop_backend().prepare_new_login()
-                self._q.put(("prep_ok", str(backup.path)))
-            except RollbackError as error:
-                self._q.put(("prep_recovery", (str(error), str(error.recovery_path))))
+                backend = _desktop_backend()
+                backend.stop_desktop()
+                pending = backend.begin_new_login()
+                launch = backend.launch_active()
+                if not launch.ok:
+                    raise RuntimeError(launch.message or "Pending login launch failed")
+                if launch.user_data_dir != pending.user_data_dir:
+                    raise RuntimeError("Managed launch did not use the pending login root")
+                self._q.put(("prep_ok", (pending, launch)))
             except Exception as e:
                 self._q.put(("prep_err", str(e)))
 
@@ -1400,7 +1236,7 @@ class App:
         """Merge Claude Code + agent-mode history across every account so all
         profiles share one project list / session history. Closes Claude first
         (file safety), then redistributes the union into each account's folder."""
-        if self._busy or self._usage_busy:
+        if not self._action_ready():
             return
         if not messagebox.askyesno(
             "Sync Claude Code History",
@@ -1443,6 +1279,15 @@ class App:
             self._busy = False
             result: SwitchResult = data
             target = result.target_name
+            if not result.ok:
+                messagebox.showerror(
+                    "Switch Failed",
+                    result.message or "The profile switch could not be verified.",
+                    parent=self.root,
+                )
+                self._set_status(f"Switch failed: {result.message}")
+                self._refresh()
+                return
             self._set_status(f"Switched to '{target}'.")
             self._refresh()
             if result.history and not result.history.ok:
@@ -1452,12 +1297,14 @@ class App:
                     f"history sync failed:\n\n{result.history.message}",
                     parent=self.root,
                 )
-            if messagebox.askyesno(
-                "Launch Claude",
-                f"Now signed in as '{target}'.\n\nLaunch Claude?",
-                parent=self.root):
-                _launch_claude(_load_meta().get("aumid"))
-                self._set_status("Launching Claude…")
+            if result.should_relaunch:
+                launch = _desktop_backend().launch_active()
+                if not launch.ok:
+                    messagebox.showerror(
+                        "Launch Failed", launch.message or "Managed relaunch failed.",
+                        parent=self.root,
+                    )
+                    self._set_status(f"Switched, but relaunch failed: {launch.message}")
         elif kind == "rollback_err":
             self._busy = False
             message, recovery = data
@@ -1482,30 +1329,39 @@ class App:
             for i, p in enumerate(self._profiles):
                 if p.name == data:
                     self._select(i); break
-            # Capture closes Claude; offer to reopen it (guard in case it's
-            # somehow still running, so we don't nag / steal focus).
-            if not _claude_running() and messagebox.askyesno(
+            # Finalization closes Claude so the pending root can be renamed.
+            if messagebox.askyesno(
                 "Launch Claude", f"Saved '{data}'.\n\nReopen Claude now?",
                 parent=self.root):
-                _launch_claude(_load_meta().get("aumid"))
+                launch = _desktop_backend().launch_active()
+                if not launch.ok:
+                    messagebox.showerror("Launch Failed", launch.message, parent=self.root)
                 self._set_status("Launching Claude…")
         elif kind == "save_err":
             self._busy = False
             messagebox.showerror("Save Failed", data, parent=self.root)
             self._set_status(f"Save failed: {data}")
             self._refresh()
+        elif kind == "verify_ok":
+            self._busy = False
+            self._set_status(f"Verified '{data}'.")
+            self._refresh()
+        elif kind == "verify_err":
+            self._busy = False
+            messagebox.showerror("Verify Failed", data, parent=self.root)
+            self._set_status(f"Verify failed: {data}")
+            self._refresh()
         elif kind == "prep_ok":
             self._busy = False
             self._refresh()
-            if messagebox.askyesno(
+            pending, _launch = data
+            messagebox.showinfo(
                 "Ready for New Login",
-                "Session cleared. Launch Claude now to sign in with the new "
-                "account?\n\n(After signing in, click 'Save Current Login'.)",
-                parent=self.root):
-                _launch_claude(_load_meta().get("aumid"))
-                self._set_status("Launching Claude for new login…")
-            else:
-                self._set_status("Ready for new login — launch Claude when ready.")
+                "Claude opened with the pending isolated root:\n\n"
+                f"{pending.user_data_dir}\n\nSign in, then click 'Save Current Login'.",
+                parent=self.root,
+            )
+            self._set_status(f"Pending login launched from {pending.user_data_dir}")
         elif kind == "prep_err":
             self._busy = False
             messagebox.showerror("Prepare Failed", data, parent=self.root)
@@ -1541,19 +1397,21 @@ class App:
             self._busy = False
             messagebox.showerror("Sync Failed", data, parent=self.root)
             self._set_status(f"Sync failed: {data}")
+        elif kind == "tick":
+            self._apply_tick(*data)
+            self.root.after(5000, self._tick)
         elif kind == "usage_ok":
             name, result = data
-            m = _load_meta()
-            info = m["profiles"].setdefault(name, {})
-            info["usage"] = result
-            if result.get("email"):
-                info["email"] = result["email"]
-            if result.get("plan"):
-                info["plan"] = result["plan"]
-            _save_meta(m)
+            for profile in self._profiles:
+                if profile.name == name:
+                    profile.usage = result
+                    profile.email = result.get("email") or profile.email
+                    profile.plan = result.get("plan") or profile.plan
+                    break
             self._usage_busy = False
             self._set_status(f"Usage updated for '{name}'.")
-            self._refresh()
+            if 0 <= self._sel < len(self._profiles):
+                self._render_usage(self._profiles[self._sel])
         elif kind == "usage_err":
             name, msg = data
             self._usage_busy = False
@@ -1563,120 +1421,47 @@ class App:
                 self._render_usage(self._profiles[self._sel])
 
     def _on_rename(self):
-        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if not self._action_ready(require_selection=True):
             return
-        p = self._profiles[self._sel]
-        existing = [x.name for x in self._profiles if x.name != p.name]
-        dlg = RenameDialog(self.root, p.name, p.label, existing)
-        self.root.wait_window(dlg.top)
-        if not dlg.result:
-            return
-        new_name, new_label = dlg.result
-        m = _load_meta()
-        store_renamed = False
-        if new_name != p.name:
-            try:
-                _rename_profile_store(p.name, new_name)
-                store_renamed = True
-            except OSError as error:
-                messagebox.showerror(
-                    "Rename Failed",
-                    f"Could not rename '{p.name}'.\n\n{error}",
-                    parent=self.root,
-                )
-                return
-            m["profiles"][new_name] = m["profiles"].pop(p.name, {})
-            if m.get("active") == p.name:
-                m["active"] = new_name
-        m["profiles"].setdefault(new_name, {})["label"] = new_label
-        try:
-            _save_meta(m)
-        except OSError as error:
-            rollback_issue = ""
-            if store_renamed:
-                try:
-                    _rename_profile_store(new_name, p.name)
-                except OSError as rollback_error:
-                    rollback_issue = f"\n\nStorage rollback also failed: {rollback_error}"
-            messagebox.showerror(
-                "Rename Failed",
-                f"Could not save the renamed profile.\n\n{error}{rollback_issue}",
-                parent=self.root,
-            )
-            return
-        self._refresh()
-        for i, x in enumerate(self._profiles):
-            if x.name == new_name:
-                self._select(i); break
+        messagebox.showinfo(
+            "Rename Unavailable",
+            "Isolated profile roots cannot be renamed from this release.",
+            parent=self.root,
+        )
 
     def _on_remove(self):
-        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if not self._action_ready(require_selection=True):
             return
-        p = self._profiles[self._sel]
-        if p.is_active:
-            messagebox.showwarning(
-                "Cannot Remove",
-                f"'{p.name}' is the active profile.\n"
-                "Switch to another profile first.", parent=self.root)
-            return
-        if not messagebox.askyesno(
-            "Remove Profile",
-            f"Remove  '{p.name}'  and its saved session?\n\n"
-            "This does not log you out of Claude.",
-            parent=self.root, icon="warning"):
-            return
-        try:
-            _delete_profile_store(p.name)
-        except OSError as error:
-            messagebox.showerror(
-                "Remove Failed",
-                f"Could not completely remove '{p.name}'.\n\n{error}",
-                parent=self.root,
-            )
-            return
-        m = _load_meta()
-        m["profiles"].pop(p.name, None)
-        _save_meta(m)
-        self._set_status(f"Removed '{p.name}'.")
-        self._refresh()
+        messagebox.showinfo(
+            "Remove Unavailable",
+            "Isolated profile roots are preserved for recovery and cannot be removed from this release.",
+            parent=self.root,
+        )
 
     def _note_changed(self, _=None):
-        if not self._note_pending:
-            self._note_pending = True
-            self.root.after(900, self._save_note)
+        return
 
     def _save_note(self):
-        self._note_pending = False
-        if self._busy or self._usage_busy:
-            self._note_pending = True
-            self.root.after(500, self._save_note)
-            return
-        if not (0 <= self._sel < len(self._profiles)):
-            return
-        p = self._profiles[self._sel]
-        text = self._note.get("1.0", tk.END).strip()
-        p.note = text
-        m = _load_meta()
-        m["profiles"].setdefault(p.name, {})["note"] = text
-        _save_meta(m)
-        self._note_saved.configure(text="saved")
-        self.root.after(1800, lambda: self._note_saved.configure(text=""))
+        return
 
     def _on_launch(self):
-        if self._busy or self._usage_busy:
+        if not self._action_ready():
             return
-        m = _load_meta()
-        _launch_claude(m.get("aumid"))
+        launch = _desktop_backend().launch_active()
+        if not launch.ok:
+            messagebox.showerror("Launch Failed", launch.message, parent=self.root)
+            self._set_status(f"Launch failed: {launch.message}")
+            return
         self._set_status("Launching Claude…")
 
     def _on_stop(self):
-        if self._busy or self._usage_busy:
+        if not self._action_ready():
             return
         if not messagebox.askyesno("Stop Claude", "Close Claude Desktop?",
                                    parent=self.root):
             return
         try:
-            _kill_claude()
+            _desktop_backend().stop_desktop()
         except Exception as error:
             messagebox.showerror("Stop Failed", str(error), parent=self.root)
             self._set_status(f"Stop failed: {error}")
@@ -1733,8 +1518,8 @@ class SaveDialog(_BaseDialog):
         body = tk.Frame(t, bg=BG_PANEL)
         body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(14, 18))
         tk.Label(body,
-                 text="Capture the account currently logged into Claude "
-                      "Desktop as a switchable profile.",
+                 text="Finalize the pending isolated Claude Desktop login "
+                      "as a switchable profile.",
                  bg=BG_PANEL, fg=TXT_SUB, font=(FF, 9), justify=tk.LEFT,
                  wraplength=400, anchor="w").pack(fill=tk.X, pady=(0, 4))
 
@@ -1764,9 +1549,10 @@ class SaveDialog(_BaseDialog):
                 "Invalid Name",
                 "Use 1–32 chars: letters, numbers, hyphens, underscores.",
                 parent=self.top); return
-        if name in self.existing and not messagebox.askyesno(
-            "Overwrite?", f"Profile '{name}' exists. Overwrite its snapshot?",
-            parent=self.top):
+        if name in self.existing:
+            messagebox.showwarning(
+                "Name Taken", f"Profile '{name}' already exists.", parent=self.top
+            )
             return
         self.result = (name, self._label.get().strip(), self._note.get().strip())
         self.top.destroy()
