@@ -437,6 +437,59 @@ class BackendTestCase(unittest.TestCase):
             with self.assertRaises(OSError):
                 WindowsDesktopProcessAdapter().desktop_pids()
 
+    def test_windows_process_detection_accepts_registered_store_desktop(self) -> None:
+        executable = (
+            r"C:\Program Files\WindowsApps\Claude_1.26832.0.0_x64__pzs8sxrjxfjjc"
+            r"\app\Claude.exe"
+        )
+        process_query = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ProcessId": 10, "ExecutablePath": executable}),
+            stderr="",
+        )
+        package_query = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(executable),
+            stderr="",
+        )
+
+        with patch.object(
+            desktop_backend.subprocess,
+            "run",
+            side_effect=[process_query, package_query],
+        ):
+            pids = WindowsDesktopProcessAdapter().desktop_pids()
+
+        self.assertEqual([10], pids)
+
+    def test_windows_process_detection_rejects_unregistered_store_executable(self) -> None:
+        registered = (
+            r"C:\Program Files\WindowsApps\Claude_1.26832.0.0_x64__pzs8sxrjxfjjc"
+            r"\app\Claude.exe"
+        )
+        unregistered = (
+            r"C:\Program Files\WindowsApps\Claude_9.9.9.9_x64__pzs8sxrjxfjjc"
+            r"\app\Claude.exe"
+        )
+        process_query = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ProcessId": 10, "ExecutablePath": unregistered}),
+            stderr="",
+        )
+        package_query = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(registered),
+            stderr="",
+        )
+
+        with patch.object(
+            desktop_backend.subprocess,
+            "run",
+            side_effect=[process_query, package_query],
+        ):
+            with self.assertRaises(OSError):
+                WindowsDesktopProcessAdapter().desktop_pids()
+
     def test_force_stop_targets_only_the_verified_desktop_pids(self) -> None:
         process = StubbornProcessAdapter()
         backend = self.switched_backend(process=process)

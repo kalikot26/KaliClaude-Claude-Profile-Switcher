@@ -128,6 +128,33 @@ class WindowsDesktopProcessAdapter:
 
     _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+    def _registered_store_executables(self) -> set[str]:
+        command = (
+            "@(Get-AppxPackage -Name Claude -ErrorAction Stop | "
+            "Where-Object { $_.PackageFamilyName -eq 'Claude_pzs8sxrjxfjjc' "
+            "-and $_.Publisher -like '*Anthropic, PBC*' } | "
+            "ForEach-Object { Join-Path $_.InstallLocation 'app\\Claude.exe' }) | "
+            "ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            creationflags=self._NO_WINDOW,
+        )
+        if result.returncode != 0:
+            raise OSError("Unable to verify the Claude Desktop Store package")
+        try:
+            paths = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as error:
+            raise OSError("Claude Desktop package query returned invalid data") from error
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise OSError("Claude Desktop package query returned invalid data")
+        return {path.replace("/", "\\").lower() for path in paths}
+
     def desktop_pids(self) -> list[int]:
         if os.name != "nt":
             raise OSError("Claude Desktop switching is Windows-only")
@@ -153,6 +180,7 @@ class WindowsDesktopProcessAdapter:
         if not isinstance(rows, list):
             raise OSError("Claude Desktop process query returned invalid data")
         pids: list[int] = []
+        registered_store: Optional[set[str]] = None
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -172,7 +200,19 @@ class WindowsDesktopProcessAdapter:
                     or executable.endswith("\\.local\\bin\\claude.exe")
                 )
             )
+            is_store_candidate = (
+                "\\windowsapps\\claude_" in executable
+                and executable.endswith("\\app\\claude.exe")
+            )
             if is_desktop:
+                pids.append(int(row["ProcessId"]))
+            elif is_store_candidate:
+                if registered_store is None:
+                    registered_store = self._registered_store_executables()
+                if executable not in registered_store:
+                    raise OSError(
+                        "A Claude Store process did not match the registered package"
+                    )
                 pids.append(int(row["ProcessId"]))
             elif not is_claude_code:
                 raise OSError(
