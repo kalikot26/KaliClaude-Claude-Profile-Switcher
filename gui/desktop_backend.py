@@ -14,6 +14,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ SESSION_ITEMS = (
     ("Local Storage", "dir"),
     ("Network/Cookies", "file"),
     ("Network/Cookies-journal", "optional_file"),
+    ("Network/Cookies-wal", "optional_file"),
+    ("Network/Cookies-shm", "optional_file"),
 )
 CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
 MAX_HISTORY_BACKUPS = 5
@@ -156,12 +159,25 @@ class WindowsDesktopProcessAdapter:
             executable = str(row.get("ExecutablePath") or "").replace("/", "\\").lower()
             if not executable:
                 raise OSError("A claude.exe process could not be identified safely")
-            if (
+            is_desktop = (
                 executable.endswith("\\claude.exe")
                 and "\\anthropicclaude\\app-" in executable
                 and "\\claude-code\\" not in executable
-            ):
+            )
+            is_claude_code = (
+                executable.endswith("\\claude.exe")
+                and (
+                    "\\claude-code\\" in executable
+                    or "\\@anthropic-ai\\claude-code\\" in executable
+                    or executable.endswith("\\.local\\bin\\claude.exe")
+                )
+            )
+            if is_desktop:
                 pids.append(int(row["ProcessId"]))
+            elif not is_claude_code:
+                raise OSError(
+                    "An unrecognized claude.exe process could not be classified safely"
+                )
         return pids
 
     def request_close(self, pids: list[int]) -> None:
@@ -394,20 +410,33 @@ class DesktopBackend:
         if not cookies.is_file():
             return "Cookies database is missing"
         try:
-            uri = cookies.resolve().as_uri() + "?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True)) as db:
-                if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                    return "Cookies database is corrupt"
-                columns = {
-                    row[1] for row in db.execute("PRAGMA table_info(cookies)").fetchall()
-                }
-                if not {"host_key", "name", "encrypted_value"}.issubset(columns):
-                    return "Cookies database has an unsupported schema"
-                row = db.execute(
-                    "SELECT encrypted_value FROM cookies "
-                    "WHERE (host_key = 'claude.ai' OR host_key LIKE '%.claude.ai') "
-                    "AND name = 'sessionKey' ORDER BY LENGTH(encrypted_value) DESC LIMIT 1"
-                ).fetchone()
+            # Even a read-only SQLite connection may create or rewrite the SHM
+            # sidecar while inspecting a WAL database. Validate an isolated copy
+            # so auditing never mutates a saved snapshot or live Desktop state.
+            with tempfile.TemporaryDirectory(prefix="kaliclaude-cookie-audit-") as temp:
+                copied_network = Path(temp) / "Network"
+                copied_network.mkdir(parents=True)
+                for filename in ("Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"):
+                    source = session / "Network" / filename
+                    if source.is_file():
+                        shutil.copy2(source, copied_network / filename)
+                copied_cookies = copied_network / "Cookies"
+                uri = copied_cookies.resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True)) as db:
+                    if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        return "Cookies database is corrupt"
+                    columns = {
+                        row[1]
+                        for row in db.execute("PRAGMA table_info(cookies)").fetchall()
+                    }
+                    if not {"host_key", "name", "encrypted_value"}.issubset(columns):
+                        return "Cookies database has an unsupported schema"
+                    row = db.execute(
+                        "SELECT encrypted_value FROM cookies "
+                        "WHERE (host_key = 'claude.ai' OR host_key LIKE '%.claude.ai') "
+                        "AND name = 'sessionKey' "
+                        "ORDER BY LENGTH(encrypted_value) DESC LIMIT 1"
+                    ).fetchone()
             encrypted = bytes(row[0]) if row and row[0] is not None else b""
             if not encrypted or not self._cookie_decoder(encrypted):
                 return "Cookies database has no locally decryptable sessionKey"

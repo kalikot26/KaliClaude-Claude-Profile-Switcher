@@ -157,14 +157,65 @@ def _live_blob() -> Optional[str]:
 def _profile_dir(name: str) -> Path:
     return STORE_DIR / name
 
+def _retained_profile_generations(name: str) -> list[Path]:
+    root = STORE_DIR / ".previous"
+    prefix = f"{name}-"
+    if not root.is_dir():
+        return []
+    return [
+        path
+        for path in root.iterdir()
+        if path.is_dir()
+        and path.name.startswith(prefix)
+        and len(path.name[len(prefix):]) == 20
+        and path.name[len(prefix):].isdigit()
+    ]
+
+def _rename_profile_store(old_name: str, new_name: str) -> None:
+    moves: list[tuple[Path, Path]] = []
+    old_prefix = f"{old_name}-"
+    for generation in sorted(_retained_profile_generations(old_name)):
+        stamp = generation.name[len(old_prefix):]
+        moves.append((generation, generation.with_name(f"{new_name}-{stamp}")))
+    legacy = STORE_DIR / f"{old_name}.blob"
+    if legacy.exists():
+        moves.append((legacy, STORE_DIR / f"{new_name}.blob"))
+    current = _profile_dir(old_name)
+    if current.exists():
+        moves.append((current, _profile_dir(new_name)))
+
+    for _source, destination in moves:
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"Profile storage already exists at {destination}")
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in moves:
+            os.replace(source, destination)
+            moved.append((source, destination))
+    except OSError as error:
+        rollback_errors: list[str] = []
+        for source, destination in reversed(moved):
+            try:
+                os.replace(destination, source)
+            except OSError as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        if rollback_errors:
+            raise OSError(
+                f"Profile rename failed and could not be fully rolled back: "
+                f"{'; '.join(rollback_errors)}"
+            ) from error
+        raise
+
 def _delete_profile_store(name: str) -> None:
-    d = _profile_dir(name)
-    if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
+    for generation in _retained_profile_generations(name):
+        shutil.rmtree(generation)
     legacy = STORE_DIR / f"{name}.blob"
     if legacy.exists():
-        try: legacy.unlink()
-        except OSError: pass
+        legacy.unlink()
+    d = _profile_dir(name)
+    if d.exists():
+        shutil.rmtree(d)
 
 def _valid_name(name: str) -> bool:
     return bool(name) and len(name) <= 32 and all(
@@ -1522,19 +1573,37 @@ class App:
             return
         new_name, new_label = dlg.result
         m = _load_meta()
+        store_renamed = False
         if new_name != p.name:
-            # move the profile's snapshot directory (and any legacy flat blob)
-            old_dir = _profile_dir(p.name)
-            if old_dir.exists():
-                old_dir.rename(_profile_dir(new_name))
-            legacy = STORE_DIR / f"{p.name}.blob"
-            if legacy.exists():
-                legacy.rename(STORE_DIR / f"{new_name}.blob")
+            try:
+                _rename_profile_store(p.name, new_name)
+                store_renamed = True
+            except OSError as error:
+                messagebox.showerror(
+                    "Rename Failed",
+                    f"Could not rename '{p.name}'.\n\n{error}",
+                    parent=self.root,
+                )
+                return
             m["profiles"][new_name] = m["profiles"].pop(p.name, {})
             if m.get("active") == p.name:
                 m["active"] = new_name
         m["profiles"].setdefault(new_name, {})["label"] = new_label
-        _save_meta(m)
+        try:
+            _save_meta(m)
+        except OSError as error:
+            rollback_issue = ""
+            if store_renamed:
+                try:
+                    _rename_profile_store(new_name, p.name)
+                except OSError as rollback_error:
+                    rollback_issue = f"\n\nStorage rollback also failed: {rollback_error}"
+            messagebox.showerror(
+                "Rename Failed",
+                f"Could not save the renamed profile.\n\n{error}{rollback_issue}",
+                parent=self.root,
+            )
+            return
         self._refresh()
         for i, x in enumerate(self._profiles):
             if x.name == new_name:
@@ -1556,7 +1625,15 @@ class App:
             "This does not log you out of Claude.",
             parent=self.root, icon="warning"):
             return
-        _delete_profile_store(p.name)
+        try:
+            _delete_profile_store(p.name)
+        except OSError as error:
+            messagebox.showerror(
+                "Remove Failed",
+                f"Could not completely remove '{p.name}'.\n\n{error}",
+                parent=self.root,
+            )
+            return
         m = _load_meta()
         m["profiles"].pop(p.name, None)
         _save_meta(m)

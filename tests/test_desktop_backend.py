@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import gui.desktop_backend as desktop_backend
+import gui.app as app
 from gui.desktop_backend import (
     DesktopBackend,
     ProcessDetectionError,
@@ -420,6 +421,22 @@ class BackendTestCase(unittest.TestCase):
             with self.assertRaises(OSError):
                 WindowsDesktopProcessAdapter().desktop_pids()
 
+    def test_windows_process_detection_rejects_unknown_claude_executable(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ProcessId": 10,
+                    "ExecutablePath": r"C:\Portable\Claude\claude.exe",
+                }
+            ),
+            stderr="",
+        )
+
+        with patch.object(desktop_backend.subprocess, "run", return_value=completed):
+            with self.assertRaises(OSError):
+                WindowsDesktopProcessAdapter().desktop_pids()
+
     def test_force_stop_targets_only_the_verified_desktop_pids(self) -> None:
         process = StubbornProcessAdapter()
         backend = self.switched_backend(process=process)
@@ -443,6 +460,53 @@ class BackendTestCase(unittest.TestCase):
         config = json.loads((self.claude_dir / "config.json").read_text())
         self.assertEqual("A_V1", config["oauth:tokenCache"])
         self.assertEqual("A_V2", config["oauth:tokenCacheV2"])
+
+    def test_switch_replaces_cookie_wal_and_shm_with_target_versions(self) -> None:
+        profile_a = self.create_legacy_profile("a", "A_V2")
+        profile_b = self.create_legacy_profile("b", "B_V2")
+        (profile_a / "session" / "Network" / "Cookies-wal").write_bytes(b"A-WAL")
+        (profile_a / "session" / "Network" / "Cookies-shm").write_bytes(b"A-SHM")
+        (profile_b / "session" / "Network" / "Cookies-wal").write_bytes(b"B-WAL")
+        (profile_b / "session" / "Network" / "Cookies-shm").write_bytes(b"B-SHM")
+        self.write_meta({"a": {"label": "A"}, "b": {"label": "B"}}, active="b")
+        self.backend.audit_and_migrate()
+        self.create_live(v2="B_V2")
+        (self.claude_dir / "Network" / "Cookies-wal").write_bytes(b"LIVE-B-WAL")
+        (self.claude_dir / "Network" / "Cookies-shm").write_bytes(b"LIVE-B-SHM")
+
+        self.switched_backend().switch("a")
+
+        self.assertEqual(
+            b"A-WAL", (self.claude_dir / "Network" / "Cookies-wal").read_bytes()
+        )
+        self.assertEqual(
+            b"A-SHM", (self.claude_dir / "Network" / "Cookies-shm").read_bytes()
+        )
+
+    def test_cookie_validation_does_not_modify_saved_sidecars(self) -> None:
+        profile = self.create_legacy_profile("a", "A_V2")
+        wal = profile / "session" / "Network" / "Cookies-wal"
+        shm = profile / "session" / "Network" / "Cookies-shm"
+        wal.write_bytes(b"A-WAL")
+        shm.write_bytes(b"A-SHM")
+        before = {"wal": wal.read_bytes(), "shm": shm.read_bytes()}
+        self.write_meta({"a": {"label": "A"}})
+
+        self.backend.audit_and_migrate()
+
+        self.assertEqual(before["wal"], wal.read_bytes())
+        self.assertEqual(before["shm"], shm.read_bytes())
+
+    def test_switch_removes_cookie_sidecars_absent_from_target(self) -> None:
+        self.migrate_two_profiles(active="b")
+        self.create_live(v2="B_V2")
+        (self.claude_dir / "Network" / "Cookies-wal").write_bytes(b"LIVE-B-WAL")
+        (self.claude_dir / "Network" / "Cookies-shm").write_bytes(b"LIVE-B-SHM")
+
+        self.switched_backend().switch("a")
+
+        self.assertFalse((self.claude_dir / "Network" / "Cookies-wal").exists())
+        self.assertFalse((self.claude_dir / "Network" / "Cookies-shm").exists())
 
     def test_capture_failure_preserves_previous_valid_snapshot(self) -> None:
         self.migrate_two_profiles(active="b")
@@ -519,6 +583,8 @@ class BackendTestCase(unittest.TestCase):
             "restore:Local Storage",
             "restore:Network/Cookies",
             "restore:Network/Cookies-journal",
+            "restore:Network/Cookies-wal",
+            "restore:Network/Cookies-shm",
             "restore:config",
             "metadata",
         ]
@@ -539,6 +605,8 @@ class BackendTestCase(unittest.TestCase):
                 try:
                     self.migrate_two_profiles(active="b")
                     self.create_live(v2="B_V2", cookie=b"VALID-B-LIVE")
+                    (claude / "Network" / "Cookies-wal").write_bytes(b"LIVE-B-WAL")
+                    (claude / "Network" / "Cookies-shm").write_bytes(b"LIVE-B-SHM")
                     live_before = self.tree_digest(claude)
                     meta_before = backend.meta_file.read_bytes()
 
@@ -623,6 +691,48 @@ class BackendTestCase(unittest.TestCase):
 
         for name in forbidden_imports:
             self.assertNotIn(f"import {name}", source)
+
+    def test_remove_profile_deletes_only_its_retained_generations(self) -> None:
+        store = self.cache_dir / "profiles"
+        current = store / "a"
+        legacy = store / "a.blob"
+        generation = store / ".previous" / "a-20260809123456789012"
+        similarly_named = store / ".previous" / "a-b-20260809123456789012"
+        for path in (current, generation, similarly_named):
+            path.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("credential", encoding="utf-8")
+
+        with patch.object(app, "STORE_DIR", store):
+            app._delete_profile_store("a")
+
+        self.assertFalse(current.exists())
+        self.assertFalse(legacy.exists())
+        self.assertFalse(generation.exists())
+        self.assertTrue(similarly_named.exists())
+
+    def test_rename_then_remove_deletes_retained_generations(self) -> None:
+        store = self.cache_dir / "profiles"
+        current = store / "a"
+        legacy = store / "a.blob"
+        generation = store / ".previous" / "a-20260809123456789012"
+        similarly_named = store / ".previous" / "a-b-20260809123456789012"
+        for path in (current, generation, similarly_named):
+            path.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("credential", encoding="utf-8")
+
+        with patch.object(app, "STORE_DIR", store):
+            app._rename_profile_store("a", "renamed")
+            app._delete_profile_store("renamed")
+
+        self.assertFalse((store / "renamed").exists())
+        self.assertFalse((store / "renamed.blob").exists())
+        self.assertFalse(
+            (store / ".previous" / "renamed-20260809123456789012").exists()
+        )
+        self.assertFalse(current.exists())
+        self.assertFalse(legacy.exists())
+        self.assertFalse(generation.exists())
+        self.assertTrue(similarly_named.exists())
 
     def test_default_cookie_decoder_strips_chromium_host_hash_prefix(self) -> None:
         backend = DesktopBackend(claude_dir=self.claude_dir, cache_dir=self.cache_dir)

@@ -69,8 +69,9 @@ work:
 ## 🧠 How it works
 
 **A Claude login is a whole web session, not just a token.** A profile snapshots
-the embedded claude.ai Session Storage, Local Storage, IndexedDB, cookies, and
-the encrypted `oauth:tokenCache` / `oauth:tokenCacheV2` values. Every healthy
+the embedded claude.ai Session Storage, Local Storage, IndexedDB, cookie database
+(including SQLite journal/WAL/SHM sidecars), and the encrypted
+`oauth:tokenCache` / `oauth:tokenCacheV2` values. Every healthy
 snapshot has a schema-2 manifest with artifact sizes and SHA-256 hashes. The
 account ID is stored only as a hash.
 
@@ -84,6 +85,8 @@ identity—not from stale UI metadata. The target is validated before Claude is
 closed, the outgoing session is staged and validated, and a verified recovery
 backup is created before restoration. Metadata is committed last. History sync
 runs afterward, so a history error cannot undo a successful login switch.
+An unrecognized `claude.exe` path is treated as a detection failure, never as
+proof that Desktop is stopped.
 
 **Claude Code history is local — and account-scoped.** Claude Code stores its
 sessions at `claude-code-sessions\<workspace>\<accountId>\`. Because the folder is
