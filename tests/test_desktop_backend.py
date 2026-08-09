@@ -317,7 +317,7 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(proof_keys, set(self.meta()["launch_proofs"]))
 
-    def test_cached_proof_is_consulted_but_new_version_requires_startup_record(self) -> None:
+    def test_cached_proof_still_requires_a_new_startup_record(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.assertTrue(self.backend.launch_active().ok)
         self.platform.pids = []
@@ -325,7 +325,7 @@ class IsolatedDesktopTests(unittest.TestCase):
 
         cached = self.backend.launch_active()
 
-        self.assertTrue(cached.ok)
+        self.assertFalse(cached.ok)
         self.platform.pids = []
         self.platform.version = "2.0.0"
         invalidated = self.backend.launch_active()

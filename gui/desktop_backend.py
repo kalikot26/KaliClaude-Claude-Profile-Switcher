@@ -114,6 +114,7 @@ class ExecutableSpec:
 class _LaunchVerification:
     proof_key: str
     ready: bool
+    already_isolation_verified: bool
 
 
 @dataclass(frozen=True)
@@ -650,10 +651,11 @@ class DesktopBackend:
             # launch wrote to the selected root, so an ignored env variable fails
             # closed. New executable versions must additionally establish a new
             # startup record before their proof is cached.
-            if pids and new_log and (cached_proof or "startup" in text or "started" in text):
+            if pids and new_log and ("startup" in text or "started" in text):
                 return _LaunchVerification(
                     proof_key=proof_key,
                     ready=("account active" in text or "logged in" in text or "login successful" in text),
+                    already_isolation_verified=cached_proof,
                 )
             if time.monotonic() >= deadline:
                 if not pids:
@@ -662,7 +664,8 @@ class DesktopBackend:
             time.sleep(self._launch_poll_interval)
 
     def _apply_launch_verification(self, meta: dict[str, Any], name: str, verification: _LaunchVerification) -> None:
-        meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
+        if not verification.already_isolation_verified:
+            meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
         entry = meta["profiles"][name]
         if verification.ready:
             entry["state"] = ProfileState.READY.value
