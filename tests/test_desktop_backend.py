@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -401,6 +404,491 @@ class IsolatedDesktopTests(unittest.TestCase):
 
         with self.assertRaises(ProcessDetectionError):
             backend.desktop_pids()
+
+
+class LegacyMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.default_root = root / "Claude"
+        self.cache = root / "cache"
+        self.open_databases: list[sqlite3.Connection] = []
+        self.backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=FakePlatform(),
+            oauth_decoder=self.decode_oauth,
+            cookie_decoder=self.decode_cookie,
+        )
+
+    def tearDown(self) -> None:
+        for database in self.open_databases:
+            database.close()
+        self.temp.cleanup()
+
+    @staticmethod
+    def decode_oauth(blob: str) -> dict | None:
+        if blob == "ENCRYPTED_EMPTY_V1":
+            return {}
+        account = blob.split("_", 1)[0].lower()
+        if account not in {"a", "b", "old"}:
+            return None
+        return {f"organization:oauth-{account}:scope": {"token": "opaque"}}
+
+    @staticmethod
+    def decode_cookie(blob: bytes) -> str | None:
+        return "locally-decrypted-session" if blob.startswith(b"v10\x00") else None
+
+    @staticmethod
+    def create_leveldb(root: Path, marker: bytes = b"records") -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "CURRENT").write_text("MANIFEST-000001\n", encoding="ascii")
+        (root / "MANIFEST-000001").write_bytes(b"manifest")
+        (root / "000003.log").write_bytes(marker)
+
+    def create_cookie_database(
+        self,
+        root: Path,
+        *,
+        cookie: bytes = b"v10\x00encrypted-session",
+        row_in_wal: bool = False,
+    ) -> None:
+        cookies = root / "Network" / "Cookies"
+        cookies.parent.mkdir(parents=True, exist_ok=True)
+        database = sqlite3.connect(cookies)
+        if row_in_wal:
+            self.assertEqual("wal", database.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        database.execute(
+            "CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)"
+        )
+        database.commit()
+        if row_in_wal:
+            database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        database.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".claude.ai", "sessionKey", cookie),
+        )
+        database.commit()
+        if row_in_wal:
+            self.assertTrue((cookies.parent / "Cookies-wal").is_file())
+            self.assertTrue((cookies.parent / "Cookies-shm").is_file())
+            self.open_databases.append(database)
+        else:
+            database.close()
+
+    def create_generation(
+        self,
+        root: Path,
+        *,
+        v1: str,
+        v2: str,
+        marker: bytes = b"generation",
+        cookie: bytes = b"v10\x00encrypted-session",
+        row_in_wal: bool = False,
+    ) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "oauth-v1.blob").write_text(v1, encoding="utf-8")
+        (root / "oauth-v2.blob").write_text(v2, encoding="utf-8")
+        session = root / "session"
+        self.create_leveldb(session / "Session Storage", marker)
+        self.create_leveldb(session / "Local Storage" / "leveldb", marker)
+        self.create_leveldb(
+            session / "IndexedDB" / "https_claude.ai_0.indexeddb.leveldb",
+            marker,
+        )
+        self.create_cookie_database(session, cookie=cookie, row_in_wal=row_in_wal)
+        return root
+
+    @staticmethod
+    def manifest_artifacts(root: Path) -> dict[str, dict[str, object]]:
+        return {
+            path.relative_to(root).as_posix(): {
+                "size": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+            and path.name != "backup-manifest.json"
+            and not path.name.endswith(".tmp")
+        }
+
+    def create_session_backup(
+        self,
+        name: str,
+        *,
+        account_uuid: str,
+        v1: str,
+        v2: str,
+        partition: bytes = b"partition-a",
+    ) -> Path:
+        backup = self.cache / "backups" / name
+        backup.mkdir(parents=True)
+        config = {
+            "lastKnownAccountUuid": account_uuid,
+            "oauth:tokenCache": v1,
+            "oauth:tokenCacheV2": v2,
+            "unrelated-setting": "preserved-verbatim",
+        }
+        (backup / "config.json").write_text(
+            json.dumps(config, separators=(",", ":")), encoding="utf-8"
+        )
+        (backup / "Local State").write_bytes(b'{"os_crypt":{"encrypted_key":"fixture"}}')
+        (backup / "Partitions").mkdir()
+        (backup / "Partitions" / "account-bound.bin").write_bytes(partition)
+        (backup / "Trusted Devices").mkdir()
+        (backup / "Trusted Devices" / "device.json").write_bytes(b"trusted-device")
+        manifest = {
+            "schema": 1,
+            "presence": {"config.json": True},
+            "artifacts": self.manifest_artifacts(backup),
+        }
+        (backup / "backup-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return backup
+
+    def write_legacy_meta(self, profiles: dict[str, dict], *, active: str | None = None) -> None:
+        self.cache.mkdir(parents=True, exist_ok=True)
+        (self.cache / "meta.json").write_text(
+            json.dumps({"schema": 2, "active": active, "aumid": "legacy", "profiles": profiles}),
+            encoding="utf-8",
+        )
+
+    def seed_default(self, *, account_uuid: str, v1: str, v2: str) -> None:
+        self.default_root.mkdir(parents=True, exist_ok=True)
+        (self.default_root / "config.json").write_text(
+            json.dumps(
+                {
+                    "lastKnownAccountUuid": account_uuid,
+                    "oauth:tokenCache": v1,
+                    "oauth:tokenCacheV2": v2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.default_root / "Local State").write_bytes(b"live-local-state")
+        (self.default_root / "claude_desktop_config.json").write_bytes(b'{"shared":true}')
+
+    def test_selects_newest_healthy_retained_generation_and_seeds_complete_root(self) -> None:
+        current = self.create_generation(
+            self.cache / "profiles" / "alpha",
+            v1="ENCRYPTED_EMPTY_V1",
+            v2="A_V2",
+            marker=b"degraded-current",
+        )
+        older = self.create_generation(
+            self.cache / "profiles" / ".previous" / "alpha-20260801000000000000",
+            v1="OLD_V1",
+            v2="OLD_V2",
+            marker=b"older-healthy",
+        )
+        newest = self.create_generation(
+            self.cache / "profiles" / ".previous" / "alpha-20260802000000000000",
+            v1="A_V1",
+            v2="A_V2",
+            marker=b"newest-healthy",
+        )
+        backup = self.create_session_backup(
+            "session-20260802", account_uuid="opaque-account-uuid", v1="A_V1", v2="A_V2"
+        )
+        self.default_root.mkdir(parents=True)
+        (self.default_root / "claude_desktop_config.json").write_bytes(b'{"shared":true}')
+        legacy_before = {
+            "current": file_digest(current),
+            "older": file_digest(older),
+            "newest": file_digest(newest),
+            "backup": file_digest(backup),
+        }
+        self.write_legacy_meta({"alpha": {"label": "Alpha", "note": "legacy-note"}})
+
+        report = self.backend.audit_and_migrate()
+
+        isolated = self.cache / "desktop-data" / "alpha"
+        config_bytes = (isolated / "config.json").read_bytes()
+        self.assertEqual((backup / "config.json").read_bytes(), config_bytes)
+        config = json.loads(config_bytes)
+        self.assertEqual("A_V1", config["oauth:tokenCache"])
+        self.assertEqual("A_V2", config["oauth:tokenCacheV2"])
+        self.assertNotEqual(config["oauth:tokenCache"], config["oauth:tokenCacheV2"])
+        self.assertEqual(
+            b"newest-healthy", (isolated / "Local Storage" / "leveldb" / "000003.log").read_bytes()
+        )
+        self.assertEqual((backup / "Local State").read_bytes(), (isolated / "Local State").read_bytes())
+        self.assertEqual(
+            (backup / "Partitions" / "account-bound.bin").read_bytes(),
+            (isolated / "Partitions" / "account-bound.bin").read_bytes(),
+        )
+        self.assertEqual(b'{"shared":true}', (isolated / "claude_desktop_config.json").read_bytes())
+        entry = json.loads(self.backend.meta_file.read_text())["profiles"]["alpha"]
+        self.assertEqual("needs_validation", entry["state"])
+        self.assertEqual(
+            hashlib.sha256(b"opaque-account-uuid").hexdigest(), entry["account_id_sha256"]
+        )
+        self.assertEqual(["alpha"], report.migrated)
+        self.assertNotIn("opaque-account-uuid", json.dumps(report.__dict__, default=str))
+        self.assertEqual(legacy_before["current"], file_digest(current))
+        self.assertEqual(legacy_before["older"], file_digest(older))
+        self.assertEqual(legacy_before["newest"], file_digest(newest))
+        self.assertEqual(legacy_before["backup"], file_digest(backup))
+
+    def test_exact_verified_full_config_match_is_mandatory_or_profile_needs_relogin(self) -> None:
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        backup = self.create_session_backup(
+            "session-mismatch", account_uuid="opaque-account", v1="OLD_V1", v2="A_V2"
+        )
+        # Corrupting a manifest-covered file also proves that an unverified backup is rejected.
+        (backup / "Local State").write_bytes(b"changed-after-manifest")
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+
+        report = self.backend.audit_and_migrate()
+
+        isolated = self.cache / "desktop-data" / "alpha"
+        self.assertEqual(["alpha"], report.needs_relogin)
+        self.assertFalse((isolated / "config.json").exists())
+        self.assertFalse((isolated / "Network" / "Cookies").exists())
+        entry = json.loads(self.backend.meta_file.read_text())["profiles"]["alpha"]
+        self.assertEqual("needs_relogin", entry["state"])
+        self.assertNotIn("account_id_sha256", entry)
+
+    def test_default_mapping_uses_unique_live_identity_and_ignores_stale_active_metadata(self) -> None:
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        self.create_generation(self.cache / "profiles" / "beta", v1="B_V1", v2="B_V2")
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.seed_default(account_uuid="uuid-beta", v1="B_V1", v2="B_V2")
+        default_before = file_digest(self.default_root)
+        self.write_legacy_meta(
+            {"alpha": {"label": "Alpha"}, "beta": {"label": "Beta"}}, active="alpha"
+        )
+
+        self.backend.audit_and_migrate()
+
+        meta = json.loads(self.backend.meta_file.read_text())
+        self.assertEqual("beta", meta["desktop_active"])
+        self.assertEqual("default", meta["profiles"]["beta"]["storage_mode"])
+        self.assertEqual("isolated", meta["profiles"]["alpha"]["storage_mode"])
+        self.assertEqual(
+            hashlib.sha256(b"uuid-beta").hexdigest(), meta["profiles"]["beta"]["account_id_sha256"]
+        )
+        self.assertEqual(default_before, file_digest(self.default_root))
+
+    def test_migration_is_idempotent_and_creates_one_pre_migration_backup(self) -> None:
+        legacy = self.create_generation(
+            self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2"
+        )
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+        legacy_before = file_digest(legacy)
+
+        first = self.backend.audit_and_migrate()
+        meta_before = self.backend.meta_file.read_bytes()
+        isolated_before = file_digest(self.cache / "desktop-data" / "alpha")
+        second = self.backend.audit_and_migrate()
+
+        migration_backups = list((self.cache / "backups").glob("operational-migration-*"))
+        self.assertIsNotNone(first.backup)
+        self.assertIsNone(second.backup)
+        self.assertEqual(1, len(migration_backups))
+        self.assertEqual(meta_before, self.backend.meta_file.read_bytes())
+        self.assertEqual(isolated_before, file_digest(self.cache / "desktop-data" / "alpha"))
+        self.assertEqual(legacy_before, file_digest(legacy))
+        self.assertEqual(["alpha"], second.unchanged)
+
+    def test_operational_backup_cap_preserves_all_legacy_session_backups(self) -> None:
+        backups = self.cache / "backups"
+        for index in range(5):
+            operational = backups / f"operational-history-{index}"
+            operational.mkdir(parents=True)
+            (operational / ".kalikot-operational-backup").write_text(str(index), encoding="ascii")
+        legacy_backups = []
+        for index in range(7):
+            backup = backups / f"session-legacy-{index}"
+            backup.mkdir(parents=True)
+            (backup / "opaque.bin").write_bytes(bytes([index]))
+            legacy_backups.append((backup, file_digest(backup)))
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+
+        self.backend.audit_and_migrate()
+
+        managed = [
+            path
+            for path in backups.glob("operational-*")
+            if (path / ".kalikot-operational-backup").is_file()
+        ]
+        self.assertEqual(5, len(managed))
+        self.assertFalse((backups / "operational-history-0").exists())
+        self.assertEqual(1, len(list(backups.glob("operational-migration-*"))))
+        for backup, digest in legacy_backups:
+            self.assertEqual(digest, file_digest(backup))
+
+    def test_interrupted_temp_files_are_ignored_and_displaced_staging_is_quarantined(self) -> None:
+        generation = self.create_generation(
+            self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2"
+        )
+        (generation / "session" / "Network" / "Cookies.tmp").write_bytes(b"interrupted-secret")
+        backup = self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        (backup / "config.json.tmp").write_bytes(b"interrupted-config")
+        displaced = self.cache / "desktop-data" / "alpha"
+        displaced.mkdir(parents=True)
+        (displaced / "staging-marker").write_bytes(b"must-survive")
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+
+        self.backend.audit_and_migrate()
+
+        self.assertFalse((self.cache / "desktop-data" / "alpha" / "Cookies.tmp").exists())
+        self.assertFalse((self.cache / "desktop-data" / "alpha" / "config.json.tmp").exists())
+        quarantined = list((self.cache / "desktop-data" / ".quarantine").glob("alpha-*"))
+        self.assertEqual(1, len(quarantined))
+        self.assertEqual(b"must-survive", (quarantined[0] / "staging-marker").read_bytes())
+        self.assertEqual(b"interrupted-secret", (generation / "session" / "Network" / "Cookies.tmp").read_bytes())
+        self.assertEqual(b"interrupted-config", (backup / "config.json.tmp").read_bytes())
+
+    def test_cookie_validation_materializes_real_wal_on_disposable_read_write_copy(self) -> None:
+        generation = self.create_generation(
+            self.cache / "profiles" / "alpha",
+            v1="A_V1",
+            v2="A_V2",
+            row_in_wal=True,
+        )
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+        wal = generation / "session" / "Network" / "Cookies-wal"
+        shm = generation / "session" / "Network" / "Cookies-shm"
+        sidecars_before = (wal.read_bytes(), shm.read_bytes())
+
+        report = self.backend.audit_and_migrate()
+
+        self.assertEqual(["alpha"], report.migrated)
+        with closing(sqlite3.connect(self.cache / "desktop-data" / "alpha" / "Network" / "Cookies")) as db:
+            value = db.execute(
+                "SELECT encrypted_value FROM cookies WHERE name='sessionKey'"
+            ).fetchone()[0]
+        self.assertEqual(b"v10\x00encrypted-session", bytes(value))
+        self.assertEqual(sidecars_before, (wal.read_bytes(), shm.read_bytes()))
+
+    def test_printable_non_token_cookie_is_rejected_before_decoder(self) -> None:
+        self.create_generation(
+            self.cache / "profiles" / "alpha",
+            v1="A_V1",
+            v2="A_V2",
+            cookie=b"printable-but-not-an-encrypted-token",
+        )
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+        self.backend._cookie_decoder = lambda _blob: "decoder-must-not-make-plaintext-valid"
+
+        report = self.backend.audit_and_migrate()
+
+        self.assertEqual(["alpha"], report.needs_relogin)
+        self.assertFalse((self.cache / "desktop-data" / "alpha" / "Network" / "Cookies").exists())
+
+    def test_cookie_recovery_ast_has_no_network_boundary(self) -> None:
+        source = Path(desktop_backend.__file__).read_text(encoding="utf-8")
+        module = ast.parse(source)
+        validator = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "DesktopBackend"
+            for node in node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_validate_legacy_cookies"
+        )
+        forbidden_imports = {"requests", "urllib", "http", "socket", "httpx", "aiohttp"}
+        imports = {
+            alias.name.split(".", 1)[0]
+            for node in ast.walk(module)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(node.module or "")])
+        }
+        forbidden_calls = {
+            node.func.attr
+            for node in ast.walk(validator)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        } & {"get", "post", "request", "urlopen", "create_connection"}
+        self.assertFalse(imports & forbidden_imports)
+        self.assertEqual(set(), forbidden_calls)
+
+    def test_migration_hashes_only_operation_sources_and_not_unrelated_default_files(self) -> None:
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.default_root.mkdir(parents=True)
+        unrelated = self.default_root / "Logs" / "large-unrelated.log"
+        unrelated.parent.mkdir()
+        unrelated.write_bytes(b"unrelated")
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+        hashed: list[Path] = []
+
+        original = desktop_backend._sha256_file
+
+        def record_hash(path: Path) -> str:
+            hashed.append(Path(path))
+            return original(Path(path))
+
+        with patch.object(desktop_backend, "_sha256_file", side_effect=record_hash):
+            self.backend.audit_and_migrate()
+
+        self.assertNotIn(unrelated, hashed)
+        self.assertTrue(hashed)
+
+    def test_default_migration_oauth_decoder_accepts_only_nonempty_objects(self) -> None:
+        backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=FakePlatform(),
+        )
+        backend._decrypt_chromium = lambda encrypted: encrypted
+
+        self.assertEqual({"cache": {"token": "opaque"}}, backend._decrypt_oauth(
+            desktop_backend.base64.b64encode(b'{"cache":{"token":"opaque"}}').decode("ascii")
+        ))
+        self.assertIsNone(backend._decrypt_oauth(
+            desktop_backend.base64.b64encode(b"{}").decode("ascii")
+        ))
+
+    def test_default_migration_cookie_decoder_strips_chromium_host_hash(self) -> None:
+        backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=FakePlatform(),
+        )
+        backend._decrypt_chromium = lambda _encrypted: bytes(range(32)) + b"session-key"
+
+        self.assertEqual("session-key", backend._decrypt_cookie(b"encrypted"))
+
+    def test_recovered_root_is_locally_decrypted_against_its_copied_local_state(self) -> None:
+        self.create_generation(self.cache / "profiles" / "alpha", v1="A_V1", v2="A_V2")
+        self.create_session_backup(
+            "session-alpha", account_uuid="uuid-alpha", v1="A_V1", v2="A_V2"
+        )
+        self.write_legacy_meta({"alpha": {"label": "Alpha"}})
+        decoder_roots: list[Path | None] = []
+
+        def tracked_oauth(blob: str) -> dict | None:
+            decoder_roots.append(getattr(self.backend, "_decryption_root", None))
+            return self.decode_oauth(blob)
+
+        self.backend._oauth_decoder = tracked_oauth
+
+        self.backend.audit_and_migrate()
+
+        self.assertTrue(
+            any(
+                root is not None
+                and root.parent == self.cache / "desktop-data"
+                and root.name.startswith(".alpha-migration-")
+                for root in decoder_roots
+            )
+        )
 
 
 class AppDataResolutionTests(unittest.TestCase):

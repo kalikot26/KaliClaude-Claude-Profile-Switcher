@@ -11,10 +11,14 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
+import tempfile
 import time
 import uuid
 import re
+from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -24,6 +28,16 @@ from typing import Any, Callable, Optional
 MANIFEST_SCHEMA = 3
 OAUTH_KEY_V1 = "oauth:tokenCache"
 OAUTH_KEY_V2 = "oauth:tokenCacheV2"
+MAX_OPERATIONAL_BACKUPS = 5
+LEGACY_SESSION_ITEMS = (
+    "Session Storage",
+    "IndexedDB",
+    "Local Storage",
+    "Network/Cookies",
+    "Network/Cookies-journal",
+    "Network/Cookies-wal",
+    "Network/Cookies-shm",
+)
 
 
 class StorageMode(str, Enum):
@@ -124,6 +138,20 @@ class _VerifiedDesktopProcess:
     started: str
 
 
+@dataclass(frozen=True)
+class _LegacyGeneration:
+    path: Path
+    oauth_v1: bytes
+    oauth_v2: bytes
+
+
+@dataclass(frozen=True)
+class _LegacyRecovery:
+    path: Path
+    config: dict[str, Any]
+    account_id_hash: str
+
+
 class DesktopBackendError(RuntimeError):
     pass
 
@@ -150,6 +178,14 @@ class RollbackError(DesktopBackendError):
 
 def _sha256(value: str | bytes) -> str:
     return hashlib.sha256(value.encode("utf-8") if isinstance(value, str) else value).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -367,6 +403,7 @@ class DesktopBackend:
         self.desktop_data_dir = self.cache_dir / "desktop-data"
         self.profiles_dir = self.cache_dir / "profiles"  # read-only legacy store for Task 2
         self.meta_file = self.cache_dir / "meta.json"
+        self.backups_dir = self.cache_dir / "backups"
         self._process = process_adapter or WindowsDesktopProcessAdapter()
         self._history_sync = history_sync
         self._oauth_decoder = oauth_decoder
@@ -376,6 +413,7 @@ class DesktopBackend:
         self._launch_timeout = launch_timeout
         self._launch_poll_interval = launch_poll_interval
         self._os_crypt_key_cache: Optional[bytes] = None
+        self._decryption_root: Optional[Path] = None
 
     def _load_meta(self) -> dict[str, Any]:
         meta = _load_json(self.meta_file)
@@ -739,20 +777,520 @@ class DesktopBackend:
         finally:
             self._clear_decryption_cache()
 
-    def audit_and_migrate(self) -> MigrationReport:
-        """Record schema-3 metadata only; lossless legacy recovery is Task 2."""
+    @staticmethod
+    def _is_interrupted_path(path: Path) -> bool:
+        return any(part.endswith(".tmp") for part in path.parts)
+
+    @classmethod
+    def _operation_files(cls, root: Path) -> list[Path]:
+        if root.is_file():
+            return [] if cls._is_interrupted_path(Path(root.name)) else [root]
+        if not root.is_dir():
+            return []
+        return [
+            path
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and not cls._is_interrupted_path(path.relative_to(root))
+        ]
+
+    @staticmethod
+    def _cached_file_hash(path: Path, hashes: dict[Path, str]) -> str:
+        resolved = path.resolve()
+        if resolved not in hashes:
+            hashes[resolved] = _sha256_file(path)
+        return hashes[resolved]
+
+    def _copy_verified(self, source: Path, destination: Path, hashes: dict[Path, str]) -> None:
+        if source.is_file():
+            if self._is_interrupted_path(Path(source.name)):
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            if self._cached_file_hash(source, hashes) != self._cached_file_hash(destination, hashes):
+                raise DesktopBackendError("Migration copy verification failed")
+            return
+        if not source.is_dir():
+            return
+        destination.mkdir(parents=True, exist_ok=True)
+        for path in self._operation_files(source):
+            relative = path.relative_to(source)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            if self._cached_file_hash(path, hashes) != self._cached_file_hash(target, hashes):
+                raise DesktopBackendError("Migration copy verification failed")
+
+    def _prune_operational_backups(self) -> None:
+        if not self.backups_dir.is_dir():
+            return
+        managed = [
+            path
+            for path in self.backups_dir.glob("operational-*")
+            if path.is_dir() and (path / ".kalikot-operational-backup").is_file()
+        ]
+        managed.sort(key=lambda path: (path.stat().st_mtime_ns, path.name))
+        for obsolete in managed[:-MAX_OPERATIONAL_BACKUPS]:
+            shutil.rmtree(obsolete)
+
+    def _pre_migration_backup(self, hashes: dict[Path, str]) -> Optional[BackupRef]:
+        destination = self.backups_dir / "operational-migration-schema2"
+        if destination.is_dir() and (destination / ".kalikot-operational-backup").is_file():
+            return None
+        self.backups_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.backups_dir / f".operational-migration-{uuid.uuid4().hex}.tmp"
+        temporary.mkdir(parents=True, exist_ok=False)
+        artifacts: dict[str, dict[str, Any]] = {}
         try:
-            meta = self._load_meta()
+            if self.profiles_dir.is_dir():
+                shutil.copytree(self.profiles_dir, temporary / "profiles")
+                for source in self._operation_files(self.profiles_dir):
+                    relative = Path("profiles") / source.relative_to(self.profiles_dir)
+                    copied = temporary / relative
+                    source_hash = self._cached_file_hash(source, hashes)
+                    if source_hash != self._cached_file_hash(copied, hashes):
+                        raise DesktopBackendError("Pre-migration profile backup verification failed")
+                    artifacts[relative.as_posix()] = {
+                        "size": source.stat().st_size,
+                        "sha256": source_hash,
+                    }
+            if self.meta_file.is_file():
+                shutil.copy2(self.meta_file, temporary / "meta.json")
+                source_hash = self._cached_file_hash(self.meta_file, hashes)
+                if source_hash != self._cached_file_hash(temporary / "meta.json", hashes):
+                    raise DesktopBackendError("Pre-migration metadata backup verification failed")
+                artifacts["meta.json"] = {
+                    "size": self.meta_file.stat().st_size,
+                    "sha256": source_hash,
+                }
+            _atomic_json(temporary / "backup-manifest.json", {"schema": 1, "artifacts": artifacts})
+            (temporary / ".kalikot-operational-backup").write_text("migration-schema2", encoding="ascii")
+            if destination.exists():
+                raise DesktopBackendError("An unverified pre-migration backup already exists")
+            os.replace(temporary, destination)
+        except Exception:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        self._prune_operational_backups()
+        return BackupRef(destination)
+
+    def _legacy_profile_names(self, meta: dict[str, Any]) -> list[str]:
+        names = {
+            name
+            for name in meta.get("profiles", {})
+            if isinstance(name, str) and self._valid_name(name)
+        }
+        if self.profiles_dir.is_dir():
+            names.update(
+                path.name
+                for path in self.profiles_dir.iterdir()
+                if path.is_dir() and not path.name.startswith(".") and self._valid_name(path.name)
+            )
+        return sorted(names)
+
+    def _legacy_generation_paths(self, name: str) -> list[Path]:
+        current = self.profiles_dir / name
+        retained_root = self.profiles_dir / ".previous"
+        retained = []
+        if retained_root.is_dir():
+            retained = sorted(
+                (
+                    path
+                    for path in retained_root.iterdir()
+                    if path.is_dir()
+                    and re.fullmatch(re.escape(name) + r"-\d{14,20}", path.name)
+                ),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+        return ([current] if current.is_dir() else []) + retained
+
+    @staticmethod
+    def _valid_leveldb(path: Path) -> bool:
+        if not path.is_dir() or not (path / "CURRENT").is_file():
+            return False
+        try:
+            current = (path / "CURRENT").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            return False
+        manifest = path / current
+        if not current.startswith("MANIFEST-") or not manifest.is_file() or not manifest.stat().st_size:
+            return False
+        return any(
+            item.is_file() and item.stat().st_size and item.suffix.lower() in {".ldb", ".log"}
+            for item in path.iterdir()
+        )
+
+    def _validate_legacy_stores(self, session: Path) -> str:
+        if not self._valid_leveldb(session / "Session Storage"):
+            return "Session Storage is incomplete"
+        if not self._valid_leveldb(session / "Local Storage" / "leveldb"):
+            return "Local Storage is incomplete"
+        indexed = session / "IndexedDB"
+        if not indexed.is_dir() or not any(
+            self._valid_leveldb(path)
+            for path in indexed.glob("*.indexeddb.leveldb")
+            if path.is_dir()
+        ):
+            return "IndexedDB is incomplete"
+        return ""
+
+    def _validate_legacy_cookies(self, session: Path) -> str:
+        """Validate saved cookies offline on a disposable read/write SQLite copy."""
+        cookies = session / "Network" / "Cookies"
+        if not cookies.is_file():
+            return "Cookies database is missing"
+        try:
+            with tempfile.TemporaryDirectory(prefix="kaliclaude-cookie-audit-") as directory:
+                copied_network = Path(directory) / "Network"
+                copied_network.mkdir(parents=True)
+                for filename in ("Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"):
+                    source = session / "Network" / filename
+                    if source.is_file() and not source.name.endswith(".tmp"):
+                        shutil.copy2(source, copied_network / filename)
+                copied = copied_network / "Cookies"
+                with closing(sqlite3.connect(copied)) as database:
+                    if database.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                        return "Cookies database is corrupt"
+                    columns = {
+                        row[1] for row in database.execute("PRAGMA table_info(cookies)").fetchall()
+                    }
+                    if not {"host_key", "name", "encrypted_value"}.issubset(columns):
+                        return "Cookies database schema is unsupported"
+                    row = database.execute(
+                        "SELECT encrypted_value FROM cookies "
+                        "WHERE (host_key='claude.ai' OR host_key LIKE '%.claude.ai') "
+                        "AND name='sessionKey' ORDER BY LENGTH(encrypted_value) DESC LIMIT 1"
+                    ).fetchone()
+                    database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                encrypted = bytes(row[0]) if row and row[0] is not None else b""
+                if not encrypted or all(32 <= value <= 126 for value in encrypted):
+                    return "Cookies database has no encrypted session token"
+                decoder = self._cookie_decoder or self._decrypt_cookie
+                if not decoder(encrypted):
+                    return "Cookies database has no locally decryptable session token"
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return "Cookies database is corrupt or unreadable"
+        return ""
+
+    def _audit_legacy_generation(self, path: Path) -> Optional[_LegacyGeneration]:
+        v1_path = path / "oauth-v1.blob"
+        v2_path = path / "oauth-v2.blob"
+        if not v2_path.is_file() and (path / "oauth.blob").is_file():
+            v2_path = path / "oauth.blob"
+        if not v1_path.is_file() or not v2_path.is_file():
+            return None
+        try:
+            v1 = v1_path.read_bytes()
+            v2 = v2_path.read_bytes()
+            decoder = self._oauth_decoder or self._decrypt_oauth
+            decoded_v1 = decoder(v1.decode("utf-8"))
+            decoded_v2 = decoder(v2.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if not isinstance(decoded_v1, dict) or not decoded_v1:
+            return None
+        if not isinstance(decoded_v2, dict) or not decoded_v2:
+            return None
+        session = path / "session"
+        if self._validate_legacy_cookies(session) or self._validate_legacy_stores(session):
+            return None
+        return _LegacyGeneration(path, v1, v2)
+
+    def _select_legacy_generation(self, name: str) -> Optional[_LegacyGeneration]:
+        for path in self._legacy_generation_paths(name):
+            audited = self._audit_legacy_generation(path)
+            if audited is not None:
+                return audited
+        return None
+
+    @staticmethod
+    def _backup_copy_roots(backup: Path) -> list[Path]:
+        excluded = {
+            "backup-manifest.json",
+            "config.json",
+            "claude_desktop_config.json",
+            "Session Storage",
+            "IndexedDB",
+            "Local Storage",
+            "Network",
+        }
+        return [
+            path
+            for path in sorted(backup.iterdir(), key=lambda item: item.name)
+            if path.name not in excluded and not path.name.endswith(".tmp")
+        ]
+
+    def _manifest_file_matches(
+        self,
+        backup: Path,
+        relative: Path,
+        artifacts: dict[str, Any],
+        hashes: dict[Path, str],
+    ) -> bool:
+        path = backup / relative
+        expected = artifacts.get(relative.as_posix())
+        return (
+            path.is_file()
+            and isinstance(expected, dict)
+            and expected.get("size") == path.stat().st_size
+            and expected.get("sha256") == self._cached_file_hash(path, hashes)
+        )
+
+    def _verified_recovery_backup(
+        self,
+        generation: _LegacyGeneration,
+        hashes: dict[Path, str],
+    ) -> Optional[_LegacyRecovery]:
+        if not self.backups_dir.is_dir():
+            return None
+        for backup in sorted(self.backups_dir.glob("session-*"), key=lambda path: path.name, reverse=True):
+            if not backup.is_dir():
+                continue
+            manifest = _load_json(backup / "backup-manifest.json")
+            artifacts = manifest.get("artifacts")
+            if manifest.get("schema") != 1 or not isinstance(artifacts, dict):
+                continue
+            if not self._manifest_file_matches(backup, Path("config.json"), artifacts, hashes):
+                continue
+            try:
+                config_bytes = (backup / "config.json").read_bytes()
+                config = json.loads(config_bytes.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            v1 = config.get(OAUTH_KEY_V1)
+            v2 = config.get(OAUTH_KEY_V2)
+            account_uuid = config.get("lastKnownAccountUuid")
+            if (
+                not isinstance(v1, str)
+                or not isinstance(v2, str)
+                or v1.encode("utf-8") != generation.oauth_v1
+                or v2.encode("utf-8") != generation.oauth_v2
+                or not isinstance(account_uuid, str)
+                or not account_uuid.strip()
+            ):
+                continue
+            covered = True
+            for copy_root in self._backup_copy_roots(backup):
+                for source in self._operation_files(copy_root):
+                    relative = source.relative_to(backup)
+                    if not self._manifest_file_matches(backup, relative, artifacts, hashes):
+                        covered = False
+                        break
+                if not covered:
+                    break
+            if covered:
+                return _LegacyRecovery(backup, config, _sha256(account_uuid))
+        return None
+
+    def _legacy_organization_hashes(self, generation: _LegacyGeneration) -> list[str]:
+        decoder = self._oauth_decoder or self._decrypt_oauth
+        organizations: set[str] = set()
+        for raw in (generation.oauth_v1, generation.oauth_v2):
+            try:
+                decoded = decoder(raw.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            for key in decoded:
+                parts = key.split(":") if isinstance(key, str) else []
+                if len(parts) > 1 and parts[0].lower() in {"org", "organization"} and parts[1]:
+                    organizations.add(parts[1])
+        return sorted(_sha256(value) for value in organizations)
+
+    def _seed_clean_root(self, stage: Path, hashes: dict[Path, str]) -> None:
+        shared = self.claude_dir / "claude_desktop_config.json"
+        if shared.is_file():
+            self._copy_verified(shared, stage / shared.name, hashes)
+
+    def _seed_recovered_root(
+        self,
+        stage: Path,
+        generation: _LegacyGeneration,
+        recovery: _LegacyRecovery,
+        hashes: dict[Path, str],
+    ) -> None:
+        self._copy_verified(recovery.path / "config.json", stage / "config.json", hashes)
+        session = generation.path / "session"
+        for relative in LEGACY_SESSION_ITEMS:
+            source = session / relative
+            if source.exists():
+                self._copy_verified(source, stage / relative, hashes)
+        for source in self._backup_copy_roots(recovery.path):
+            self._copy_verified(source, stage / source.name, hashes)
+        local_state = stage / "Local State"
+        if not local_state.is_file() and (self.claude_dir / "Local State").is_file():
+            self._copy_verified(self.claude_dir / "Local State", local_state, hashes)
+        self._seed_clean_root(stage, hashes)
+        if not local_state.is_file():
+            raise SnapshotValidationError("No compatible Local State is available")
+        config = _load_json(stage / "config.json")
+        if config != recovery.config:
+            raise SnapshotValidationError("Recovered full config did not verify")
+        previous_root = self._decryption_root
+        self._decryption_root = stage
+        self._clear_decryption_cache()
+        try:
+            decoder = self._oauth_decoder or self._decrypt_oauth
+            decoded = [decoder(config[key]) for key in (OAUTH_KEY_V1, OAUTH_KEY_V2)]
+            if any(not isinstance(value, dict) or not value for value in decoded):
+                raise SnapshotValidationError("Recovered OAuth caches did not decrypt locally")
+            if self._validate_legacy_cookies(stage) or self._validate_legacy_stores(stage):
+                raise SnapshotValidationError("Recovered Desktop storage did not verify locally")
+        except SnapshotValidationError:
+            raise
+        except Exception as error:
+            raise SnapshotValidationError("Recovered Desktop storage did not decrypt locally") from error
+        finally:
+            self._clear_decryption_cache()
+            self._decryption_root = previous_root
+
+    def _promote_isolated_stage(self, name: str, stage: Path) -> Path:
+        destination = self.desktop_data_dir / name
+        quarantine = self.desktop_data_dir / ".quarantine"
+        displaced: Optional[Path] = None
+        if destination.exists():
+            quarantine.mkdir(parents=True, exist_ok=True)
+            displaced = quarantine / f"{name}-{uuid.uuid4().hex}"
+            os.replace(destination, displaced)
+        try:
+            os.replace(stage, destination)
+        except Exception:
+            if displaced is not None and displaced.exists() and not destination.exists():
+                os.replace(displaced, destination)
+            raise
+        return destination
+
+    def _new_isolated_stage(self, name: str) -> Path:
+        self.desktop_data_dir.mkdir(parents=True, exist_ok=True)
+        stage = self.desktop_data_dir / f".{name}-migration-{uuid.uuid4().hex}.tmp"
+        stage.mkdir(parents=True, exist_ok=False)
+        return stage
+
+    def audit_and_migrate(self) -> MigrationReport:
+        """Losslessly recover schema-2 profiles into isolated schema-3 roots."""
+        previous_decryption_root = self._decryption_root
+        self._decryption_root = self.claude_dir
+        try:
+            raw_meta = _load_json(self.meta_file)
             report = MigrationReport()
-            # This reader deliberately does not rewrite legacy profiles or roots.
-            # It only establishes the schema-3 metadata envelope and preserves a
-            # schema-2 active selection as desktop_active for a later migration.
-            if not self.meta_file.exists() or meta.get("schema") != MANIFEST_SCHEMA:
-                self._save_meta(meta)
-            report.unchanged.extend(sorted(name for name in meta["profiles"] if isinstance(name, str)))
+            if raw_meta.get("schema") == MANIFEST_SCHEMA:
+                profiles = raw_meta.get("profiles")
+                if isinstance(profiles, dict):
+                    report.unchanged.extend(sorted(name for name in profiles if isinstance(name, str)))
+                return report
+
+            if not isinstance(raw_meta.get("profiles"), dict):
+                raw_meta["profiles"] = {}
+            names = self._legacy_profile_names(raw_meta)
+            hashes: dict[Path, str] = {}
+            report.backup = self._pre_migration_backup(hashes)
+            generations = {name: self._select_legacy_generation(name) for name in names}
+
+            live_config = _load_json(self.claude_dir / "config.json")
+            live_v1 = live_config.get(OAUTH_KEY_V1)
+            live_v2 = live_config.get(OAUTH_KEY_V2)
+            live_uuid = live_config.get("lastKnownAccountUuid")
+            live_hash = _sha256(live_uuid) if isinstance(live_uuid, str) and live_uuid.strip() else ""
+            default_matches: list[str] = []
+            for name, generation in generations.items():
+                legacy_entry = raw_meta["profiles"].get(name)
+                saved_hash = legacy_entry.get("account_id_sha256") if isinstance(legacy_entry, dict) else ""
+                blob_match = (
+                    generation is not None
+                    and isinstance(live_v1, str)
+                    and isinstance(live_v2, str)
+                    and live_v1.encode("utf-8") == generation.oauth_v1
+                    and live_v2.encode("utf-8") == generation.oauth_v2
+                )
+                if live_hash and (blob_match or saved_hash == live_hash):
+                    default_matches.append(name)
+            default_name = default_matches[0] if len(default_matches) == 1 else None
+
+            new_profiles: dict[str, dict[str, Any]] = {}
+            for name in names:
+                legacy_entry = raw_meta["profiles"].get(name)
+                entry = legacy_entry if isinstance(legacy_entry, dict) else {}
+                migrated_entry: dict[str, Any] = {
+                    "label": str(entry.get("label") or name),
+                    "note": str(entry.get("note") or ""),
+                    "updated": float(entry.get("updated") or time.time()),
+                }
+                generation = generations[name]
+                if name == default_name:
+                    migrated_entry.update(
+                        storage_mode=StorageMode.DEFAULT.value,
+                        state=ProfileState.NEEDS_VALIDATION.value,
+                        state_reason="Awaiting verified managed launch",
+                        account_id_sha256=live_hash,
+                        oauth_organization_sha256=(
+                            self._legacy_organization_hashes(generation) if generation else []
+                        ),
+                    )
+                    report.migrated.append(name)
+                    new_profiles[name] = migrated_entry
+                    continue
+
+                recovery = (
+                    self._verified_recovery_backup(generation, hashes)
+                    if generation is not None
+                    else None
+                )
+                stage = self._new_isolated_stage(name)
+                recovered = False
+                try:
+                    if generation is not None and recovery is not None:
+                        try:
+                            self._seed_recovered_root(stage, generation, recovery, hashes)
+                            recovered = True
+                        except SnapshotValidationError:
+                            shutil.rmtree(stage)
+                            stage = self._new_isolated_stage(name)
+                            self._seed_clean_root(stage, hashes)
+                    else:
+                        self._seed_clean_root(stage, hashes)
+                    self._promote_isolated_stage(name, stage)
+                except Exception:
+                    if stage.exists():
+                        quarantine = self.desktop_data_dir / ".quarantine"
+                        quarantine.mkdir(parents=True, exist_ok=True)
+                        os.replace(stage, quarantine / f"{name}-failed-{uuid.uuid4().hex}")
+                    raise
+
+                if recovered and recovery is not None and generation is not None:
+                    migrated_entry.update(
+                        storage_mode=StorageMode.ISOLATED.value,
+                        state=ProfileState.NEEDS_VALIDATION.value,
+                        state_reason="Offline recovery awaiting verified managed launch",
+                        account_id_sha256=recovery.account_id_hash,
+                        oauth_organization_sha256=self._legacy_organization_hashes(generation),
+                    )
+                    report.migrated.append(name)
+                else:
+                    reason = "No exact verified full-config recovery match; sign in again"
+                    migrated_entry.update(
+                        storage_mode=StorageMode.ISOLATED.value,
+                        state=ProfileState.NEEDS_RELOGIN.value,
+                        state_reason=reason,
+                    )
+                    report.needs_relogin.append(name)
+                    report.issues[name] = reason
+                new_profiles[name] = migrated_entry
+
+            migrated_meta = dict(raw_meta)
+            migrated_meta["profiles"] = new_profiles
+            migrated_meta["desktop_active"] = default_name
+            migrated_meta["launch_proofs"] = (
+                raw_meta.get("launch_proofs") if isinstance(raw_meta.get("launch_proofs"), dict) else {}
+            )
+            self._save_meta(migrated_meta)
             return report
         finally:
             self._clear_decryption_cache()
+            self._decryption_root = previous_decryption_root
 
     # Compatibility names retained until Task 3 changes the GUI handlers.  They
     # do not capture, clear, restore, copy, or rollback any Desktop data.
@@ -779,12 +1317,37 @@ class DesktopBackend:
     def _os_crypt_key(self) -> bytes:
         if self._os_crypt_key_cache:
             return self._os_crypt_key_cache
-        state = _load_json(self.active_user_data_dir() / "Local State")
+        root = self._decryption_root or self.active_user_data_dir()
+        state = _load_json(root / "Local State")
         encrypted = base64.b64decode(state["os_crypt"]["encrypted_key"])
         if not encrypted.startswith(b"DPAPI"):
             raise ValueError("Unexpected os_crypt key prefix")
         self._os_crypt_key_cache = self._dpapi_unprotect(encrypted[5:])
         return self._os_crypt_key_cache
+
+    def _decrypt_chromium(self, encrypted: bytes) -> bytes:
+        if encrypted.startswith((b"v10", b"v11")):
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            return AESGCM(self._os_crypt_key()).decrypt(encrypted[3:15], encrypted[15:], None)
+        return self._dpapi_unprotect(encrypted)
+
+    def _decrypt_oauth(self, blob: str) -> Optional[dict]:
+        try:
+            value = json.loads(self._decrypt_chromium(base64.b64decode(blob)))
+        except Exception:
+            return None
+        return value if isinstance(value, dict) and value else None
+
+    def _decrypt_cookie(self, encrypted: bytes) -> Optional[str]:
+        try:
+            plaintext = self._decrypt_chromium(encrypted)
+            if len(plaintext) > 32 and any(value < 32 or value > 126 for value in plaintext[:32]):
+                plaintext = plaintext[32:]
+            value = plaintext.decode("utf-8")
+        except Exception:
+            return None
+        return value or None
 
     def _clear_decryption_cache(self) -> None:
         self._os_crypt_key_cache = None
