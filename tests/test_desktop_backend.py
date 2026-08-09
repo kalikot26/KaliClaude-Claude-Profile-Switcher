@@ -71,6 +71,9 @@ class FakePlatform:
         self.launches.append((executable, dict(env)))
         if self.launch_fails:
             raise OSError("test launch failure")
+        self._complete_launch(env)
+
+    def _complete_launch(self, env: dict[str, str]) -> None:
         self.pids = [303]
         root = Path(env["CLAUDE_USER_DATA_DIR"])
         if self.ignored_environment:
@@ -84,6 +87,33 @@ class FakePlatform:
             stream.write("\n".join(lines) + "\n")
 
 
+class DelayedPlatform(FakePlatform):
+    """Starts only after the backend has observed one empty post-launch poll."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_environment: dict[str, str] | None = None
+        self._post_launch_polls = 0
+
+    def launch(self, executable: dict, env: dict[str, str]) -> None:
+        self.launches.append((executable, dict(env)))
+        self._pending_environment = dict(env)
+
+    def desktop_pids(self) -> list[int]:
+        if self._pending_environment is not None:
+            self._post_launch_polls += 1
+            if self._post_launch_polls >= 2:
+                environment = self._pending_environment
+                self._pending_environment = None
+                self._complete_launch(environment)
+        return super().desktop_pids()
+
+
+class NoClassificationPlatform:
+    def desktop_pids(self) -> list[int]:
+        return []
+
+
 class IsolatedDesktopTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -95,6 +125,8 @@ class IsolatedDesktopTests(unittest.TestCase):
             claude_dir=self.default_root,
             cache_dir=self.cache,
             process_adapter=self.platform,
+            launch_timeout=0.02,
+            launch_poll_interval=0,
         )
 
     def tearDown(self) -> None:
@@ -285,6 +317,20 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(proof_keys, set(self.meta()["launch_proofs"]))
 
+    def test_cached_proof_is_consulted_but_new_version_requires_startup_record(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.assertTrue(self.backend.launch_active().ok)
+        self.platform.pids = []
+        self.platform.startup_record = False
+
+        cached = self.backend.launch_active()
+
+        self.assertTrue(cached.ok)
+        self.platform.pids = []
+        self.platform.version = "2.0.0"
+        invalidated = self.backend.launch_active()
+        self.assertFalse(invalidated.ok)
+
     def test_cached_proof_does_not_allow_a_later_ignored_environment(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.assertTrue(self.backend.launch_active().ok)
@@ -294,6 +340,77 @@ class IsolatedDesktopTests(unittest.TestCase):
         result = self.backend.launch_active()
 
         self.assertFalse(result.ok)
+
+    def test_launch_waits_for_async_process_and_log_startup(self) -> None:
+        delayed = DelayedPlatform()
+        backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=delayed,
+            launch_timeout=0.5,
+            launch_poll_interval=0.001,
+        )
+        self.backend = backend
+        self.create_profile("alpha", "uuid-a", "org-a")
+
+        result = backend.launch_active()
+
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(delayed._post_launch_polls, 2)
+
+    def test_failed_target_launch_stops_it_before_relaunching_previous_profile(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        self.platform.pids = [101]
+        self.platform.ignored_environment = True
+
+        result = self.backend.switch("alpha")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(2, len(self.platform.launches))
+        self.assertGreaterEqual(self.platform.closed.count(303), 1)
+        self.assertEqual(
+            str(self.cache / "desktop-data" / "beta"),
+            self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"],
+        )
+
+    def test_default_storage_mode_launches_from_the_default_root(self) -> None:
+        self.seed_root(self.default_root, account_uuid="uuid-default", organization="org-default")
+        meta = self.backend._load_meta()
+        meta["profiles"]["default"] = {
+            "label": "Default",
+            "storage_mode": desktop_backend.StorageMode.DEFAULT.value,
+            "state": ProfileState.NEEDS_VALIDATION.value,
+            "account_id_sha256": hashlib.sha256(b"uuid-default").hexdigest(),
+        }
+        meta["desktop_active"] = "default"
+        self.backend._save_meta(meta)
+
+        result = self.backend.launch_active()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(self.default_root, self.backend.active_user_data_dir())
+        self.assertEqual(str(self.default_root), self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"])
+
+    def test_missing_external_launch_classifier_fails_closed(self) -> None:
+        backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=NoClassificationPlatform(),
+        )
+
+        with self.assertRaises(ProcessDetectionError):
+            backend.desktop_pids()
+
+
+class AppDataResolutionTests(unittest.TestCase):
+    def test_default_root_uses_appdata_environment_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"APPDATA": directory}, clear=False
+        ):
+            backend = DesktopBackend(cache_dir=Path(directory) / "cache", process_adapter=FakePlatform())
+
+        self.assertEqual(Path(directory) / "Claude", backend.claude_dir)
 
 
 class WindowsExecutableResolutionTests(unittest.TestCase):
@@ -324,10 +441,32 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
         )
         with patch.object(desktop_backend.os, "name", "nt"), patch.object(
             adapter, "_run", return_value=rows
-        ), patch.object(adapter, "_valid_product", return_value=True):
+        ), patch.object(adapter, "_verified_squirrel", return_value=[
+            desktop_backend.ExecutableSpec(desktop, "1.0.0", "squirrel")
+        ]), patch.object(adapter, "_verified_msix", return_value=[]):
             pids = adapter.desktop_pids()
 
         self.assertEqual([10], pids)
+
+    def test_process_detection_rejects_custom_claude_code_even_with_matching_metadata(self) -> None:
+        desktop = Path(r"C:\\Users\\fixture\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\Claude.exe")
+        custom_code = Path(r"C:\\Tools\\ClaudeCode\\Claude.exe")
+        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        rows = json.dumps(
+            [
+                {"ProcessId": 10, "ExecutablePath": str(desktop)},
+                {"ProcessId": 20, "ExecutablePath": str(custom_code)},
+            ]
+        )
+        with patch.object(desktop_backend.os, "name", "nt"), patch.object(
+            adapter, "_run", return_value=rows
+        ), patch.object(adapter, "_verified_squirrel", return_value=[
+            desktop_backend.ExecutableSpec(desktop, "1.0.0", "squirrel")
+        ]), patch.object(adapter, "_verified_msix", return_value=[]), patch.object(
+            adapter, "_valid_product", return_value=True
+        ):
+            with self.assertRaises(OSError):
+                adapter.desktop_pids()
 
     def test_untracked_verified_desktop_process_is_unknown_external(self) -> None:
         adapter = desktop_backend.WindowsDesktopProcessAdapter()

@@ -171,6 +171,10 @@ def _version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version)) or (0,)
 
 
+def _windows_path_key(path: Path | str) -> str:
+    return str(path).replace("/", "\\").lower()
+
+
 class WindowsDesktopProcessAdapter:
     """Windows boundary for verified Claude Desktop processes and launches."""
 
@@ -252,6 +256,12 @@ class WindowsDesktopProcessAdapter:
             rows = [rows]
         if not isinstance(rows, list):
             raise OSError("Claude Desktop process query returned invalid data")
+        verified_paths = {
+            _windows_path_key(executable.path)
+            for executable in [*self._verified_squirrel(), *self._verified_msix()]
+        }
+        if not verified_paths and rows:
+            raise OSError("No installed Claude Desktop executable could be verified")
         processes: list[_VerifiedDesktopProcess] = []
         for row in rows:
             executable = str(row.get("ExecutablePath") or "") if isinstance(row, dict) else ""
@@ -263,8 +273,8 @@ class WindowsDesktopProcessAdapter:
             normalized = executable.replace("/", "\\").lower()
             if "\\claude-code\\" in normalized or "\\@anthropic-ai\\claude-code\\" in normalized or normalized.endswith("\\.local\\bin\\claude.exe"):
                 continue
-            if not self._valid_product(path):
-                raise OSError("An unrecognized Claude executable is running")
+            if normalized not in verified_paths:
+                raise OSError("A Claude executable is not an installed verified Desktop executable")
             processes.append(
                 _VerifiedDesktopProcess(
                     pid=int(row["ProcessId"]),
@@ -346,9 +356,12 @@ class DesktopBackend:
         process_adapter: Any = None,
         history_sync: Optional[Callable[[], Any]] = None,
         fault_hook: Optional[Callable[[str], None]] = None,
+        launch_timeout: float = 8.0,
+        launch_poll_interval: float = 0.05,
     ) -> None:
         home = Path.home()
-        self.claude_dir = claude_dir or home / "AppData" / "Roaming" / "Claude"
+        appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        self.claude_dir = claude_dir or appdata / "Claude"
         self.cache_dir = cache_dir or home / ".kalikot-claude-switcher"
         self.desktop_data_dir = self.cache_dir / "desktop-data"
         self.profiles_dir = self.cache_dir / "profiles"  # read-only legacy store for Task 2
@@ -359,6 +372,8 @@ class DesktopBackend:
         self._cookie_decoder = cookie_decoder
         self._claude_version = claude_version
         self._fault_hook = fault_hook or (lambda _step: None)
+        self._launch_timeout = launch_timeout
+        self._launch_poll_interval = launch_poll_interval
         self._os_crypt_key_cache: Optional[bytes] = None
 
     def _load_meta(self) -> dict[str, Any]:
@@ -534,8 +549,6 @@ class DesktopBackend:
         if not self._valid_name(name):
             raise SnapshotValidationError("Invalid profile name")
         entry, root = self._entry(name)
-        if entry.get("storage_mode") != StorageMode.ISOLATED.value:
-            raise SnapshotValidationError("Only isolated profiles can be managed by schema-3 switching")
         actual_hash = self._read_account_hash(root)
         if actual_hash != entry.get("account_id_sha256"):
             raise SnapshotValidationError("Profile config.json does not match saved account metadata")
@@ -543,7 +556,10 @@ class DesktopBackend:
 
     def _process_state(self) -> list[int]:
         try:
-            unknown = getattr(self._process, "unknown_desktop_pids", lambda: [])()
+            classifier = getattr(self._process, "unknown_desktop_pids", None)
+            if not callable(classifier):
+                raise ProcessDetectionError("The process adapter cannot classify external Claude Desktop launches")
+            unknown = classifier()
             if unknown:
                 raise UnknownLiveAccountError("An unknown external Claude Desktop launch is running")
             return list(self._process.desktop_pids())
@@ -622,21 +638,28 @@ class DesktopBackend:
         environment = dict(os.environ)
         environment["CLAUDE_USER_DATA_DIR"] = str(root)
         self._process.launch(executable, environment)
-        if not self._process_state():
-            raise DesktopBackendError("Claude Desktop launch could not be verified")
-        after = self._log_bytes(root)
-        new_log = after[len(before):] if after.startswith(before) else after
-        text = new_log.decode("utf-8", errors="ignore").lower()
         proof_key = f"{executable.path}|{executable.version}"
-        # A cached proof records that this executable/version previously honored
-        # isolation.  Every launch still needs its own selected-root startup log:
-        # otherwise a later ignored environment variable would be invisible.
-        if not ("startup" in text or "started" in text):
-            raise DesktopBackendError("Claude Desktop did not write a startup record in the selected root")
-        return _LaunchVerification(
-            proof_key=proof_key,
-            ready=("account active" in text or "logged in" in text or "login successful" in text),
-        )
+        cached_proof = proof_key in proof_keys
+        deadline = time.monotonic() + self._launch_timeout
+        while True:
+            pids = self._process_state()
+            after = self._log_bytes(root)
+            new_log = after[len(before):] if after.startswith(before) else after
+            text = new_log.decode("utf-8", errors="ignore").lower()
+            # A cached executable/version proof still requires evidence that this
+            # launch wrote to the selected root, so an ignored env variable fails
+            # closed. New executable versions must additionally establish a new
+            # startup record before their proof is cached.
+            if pids and new_log and (cached_proof or "startup" in text or "started" in text):
+                return _LaunchVerification(
+                    proof_key=proof_key,
+                    ready=("account active" in text or "logged in" in text or "login successful" in text),
+                )
+            if time.monotonic() >= deadline:
+                if not pids:
+                    raise DesktopBackendError("Claude Desktop launch could not be verified")
+                raise DesktopBackendError("Claude Desktop did not write a startup record in the selected root")
+            time.sleep(self._launch_poll_interval)
 
     def _apply_launch_verification(self, meta: dict[str, Any], name: str, verification: _LaunchVerification) -> None:
         meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
@@ -679,6 +702,11 @@ class DesktopBackend:
                 try:
                     verification = self._launch_root(target_root, executable, set(meta["launch_proofs"]))
                 except Exception as error:
+                    try:
+                        if self._process_state():
+                            self._stop_desktop()
+                    except Exception:
+                        pass
                     if previous_name and previous_name in meta["profiles"]:
                         try:
                             previous_root = self._root_for_entry(previous_name, meta["profiles"][previous_name])
