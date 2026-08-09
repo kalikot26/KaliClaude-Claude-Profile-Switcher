@@ -22,13 +22,12 @@ work:
 
 - 🖼️ **A real GUI** — a Windows desktop app for multi-account Claude Desktop,
   instead of hand-editing config files or re-logging in every time.
-- 🔐 **DPAPI session-snapshot switching** — captures the *whole* Claude web session
-  (Session Storage, IndexedDB, cookies) plus the encrypted `oauth:tokenCache`
-  blob — the Claude-side counterpart to how the Codex switcher snapshots
-  `auth.json`. No tokens are rotated; the refresh token is never used.
-- 🛡️ **Session-kill-safe switching** — every copy/swap happens only while Claude is
-  fully stopped, and the live session is backed up before anything is
-  overwritten, so each step is recoverable.
+- 🔐 **Validated DPAPI session snapshots** — captures Session Storage, Local
+  Storage, IndexedDB, cookies, and the encrypted V1/V2 OAuth caches separately.
+  Schema-2 manifests hash every artifact and the stable account identity.
+- 🛡️ **Transactional switching** — KaliClaude proves that only Claude Desktop is
+  stopped, validates the outgoing capture and live backup, atomically restores
+  the target, and rolls the complete live state back if any restore step fails.
 - 🧠 **Claude Code history sync** — merges every account's Claude Code & agent-mode
   sessions so your projects and context follow you across logins (deletion-aware).
 
@@ -39,14 +38,15 @@ work:
 
 - Python 3
 - [Tkinter](https://docs.python.org/3/library/tkinter.html) — the GUI (ttk widgets)
-- [cryptography](https://pypi.org/project/cryptography/) — AES-256-GCM + Windows DPAPI, to read usage **read-only**
+- [cryptography](https://pypi.org/project/cryptography/) — AES-256-GCM + Windows
+  DPAPI for local snapshot validation and read-only usage
 - Win32 API (`ctypes`) — DPAPI unprotect, single-instance mutex, process control
 - PyInstaller — standalone `.exe` packaging
 
 ## ✨ Features
 
-- 👥 **Profile list** with at-a-glance status — active marker (●), account email,
-  plan (Max / Pro / Team), snapshot age, and a free-text note.
+- 👥 **Profile list** with `Active`, `Ready`, `Needs re-login`, and `Corrupt`
+  states, plus account email, plan, snapshot age, and a free-text note.
 - 💾 **Save Current Login** — capture the account currently signed into Claude
   Desktop as a switchable profile (the *whole* web session, not just a token).
 - 🔀 **Switch Profile** — the *safe* switch: stop Claude → snapshot the outgoing
@@ -69,10 +69,21 @@ work:
 ## 🧠 How it works
 
 **A Claude login is a whole web session, not just a token.** A profile snapshots
-the embedded claude.ai session — Session Storage, IndexedDB, cookies — plus the
-encrypted `oauth:tokenCache` blob from `config.json`. All copying and swapping
-happens only while **Claude is fully stopped**, and the live session is backed up
-before anything is overwritten, so every step is recoverable.
+the embedded claude.ai Session Storage, Local Storage, IndexedDB, cookies, and
+the encrypted `oauth:tokenCache` / `oauth:tokenCacheV2` values. Every healthy
+snapshot has a schema-2 manifest with artifact sizes and SHA-256 hashes. The
+account ID is stored only as a hash.
+
+On first launch after upgrading, KaliClaude creates a timestamped backup and
+audits existing profiles entirely offline. Healthy profiles are migrated;
+empty, unreadable, or incomplete snapshots are preserved and shown as **Needs
+re-login**. Migration is idempotent and never deletes quarantined files.
+
+During a switch, the outgoing profile is selected from the live account
+identity—not from stale UI metadata. The target is validated before Claude is
+closed, the outgoing session is staged and validated, and a verified recovery
+backup is created before restoration. Metadata is committed last. History sync
+runs afterward, so a history error cannot undo a successful login switch.
 
 **Claude Code history is local — and account-scoped.** Claude Code stores its
 sessions at `claude-code-sessions\<workspace>\<accountId>\`. Because the folder is
@@ -103,6 +114,12 @@ python app.py
 build.bat            # runs PyInstaller, outputs dist\KaliClaude.exe
 ```
 
+**To run the automated safety tests:**
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 🚀 Usage
 
 1. Launch the app — your saved profiles appear with the active one marked ●.
@@ -118,10 +135,12 @@ build.bat            # runs PyInstaller, outputs dist\KaliClaude.exe
 
 - **Windows only** — it relies on the Claude Desktop app, Windows DPAPI, and
   Windows process management.
-- **Privacy:** everything stays on your machine. The session blob is encrypted
-  under your Windows user; it is decrypted **only in-memory** to read the access
-  token for a read-only usage request — the refresh token is never used (nothing
-  rotates), and tokens are never logged, displayed, or uploaded. The
-  single-instance IPC socket binds to `127.0.0.1` exclusively.
+- **Privacy:** snapshots and credentials stay on your machine and are never
+  logged. Saved cookies are never replayed to Claude endpoints. The manual
+  usage refresh uses only the currently active live session, in memory; it never
+  falls back to a saved profile cookie. The single-instance IPC socket binds to
+  `127.0.0.1` exclusively.
 - Profiles, snapshots, and timestamped backups live under
   `%USERPROFILE%\.kalikot-claude-switcher\`.
+- Claude Code / `cswap` account switching is intentionally deferred to Phase 2;
+  Phase 1 changes only Claude Desktop switching.

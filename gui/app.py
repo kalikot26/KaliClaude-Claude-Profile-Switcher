@@ -1,21 +1,13 @@
-"""KaliClaude Profile Switcher — session-snapshot edition.
+"""KaliClaude — validated, transactional Claude Desktop profile switching.
 
-Captures and restores the live Claude Desktop OAuth session
-(the encrypted `oauth:tokenCache` blob in %APPDATA%\\Claude\\config.json),
-mirroring how the Codex switcher snapshots auth.json. Works entirely on
-the local machine — the blob is encrypted under the current Windows user, so
-it is stored and restored verbatim for switching.
-
-For the optional, manual "Refresh Usage" action only, the blob is decrypted
-in-memory (Chromium os_crypt: AES-256-GCM with a DPAPI-protected key) to read
-the access token for a read-only usage GET to Anthropic. The refresh token is
-never used (nothing rotates) and tokens are never logged, shown, or cached.
+The GUI delegates profile auditing, schema-2 session snapshots, process-safe
+switching, and rollback to desktop_backend. The optional usage action reads only
+the active live session; saved profile cookies are never sent over the network.
 """
 from __future__ import annotations
 
 import base64
 import gzip
-import hashlib
 import json
 import os
 import queue
@@ -34,6 +26,21 @@ from typing import Optional
 
 import tkinter as tk
 from tkinter import messagebox, ttk
+
+try:
+    from .desktop_backend import (
+        DesktopBackend,
+        ProfileState,
+        RollbackError,
+        SwitchResult,
+    )
+except ImportError:  # PyInstaller runs gui/app.py as the entry script.
+    from desktop_backend import (  # type: ignore
+        DesktopBackend,
+        ProfileState,
+        RollbackError,
+        SwitchResult,
+    )
 
 # ---------------------------------------------------------------------------
 # Theme — warm dark, Claude vibe
@@ -76,59 +83,16 @@ ICON_PATH  = _res("app.ico")
 CACHE_DIR  = Path.home() / ".kalikot-claude-switcher"
 STORE_DIR  = CACHE_DIR / "profiles"     # <name>/  per-profile session snapshot
 META_FILE  = CACHE_DIR / "meta.json"    # {active, aumid, profiles:{...}}
-BACKUP_DIR = CACHE_DIR / "backups"      # timestamped config.json + session backups
-CC_SYNC_MANIFEST = CACHE_DIR / "cc-sync-manifest.json"  # last-distributed CC sessions
 
 CLAUDE_DIR    = Path.home() / "AppData" / "Roaming" / "Claude"
 CLAUDE_CONFIG = CLAUDE_DIR / "config.json"
 LOCAL_STATE   = CLAUDE_DIR / "Local State"   # holds the os_crypt AES key
-CLAUDE_LOG    = CLAUDE_DIR / "logs" / "main.log"  # LocalSessionManager load lines
 OAUTH_KEY     = "oauth:tokenCache"
 OAUTH_KEY_V2  = "oauth:tokenCacheV2"   # Claude Desktop migrated the live token cache here
-
-# A Claude login is the embedded claude.ai web session, not just the token.
-# These items (relative to CLAUDE_DIR) together make up that session; a profile
-# snapshots and restores all of them, with Claude fully stopped.
-#
-# NOTE: "Local Storage" is intentionally NOT swapped — it holds Claude Code
-# drafts (composer-draft:*) and project UI state we want SHARED across every
-# profile. The authoritative login is the oauth token (config.json) + cookies,
-# both of which are still swapped below.
-SESSION_ITEMS = [
-    ("Session Storage",        "dir"),
-    ("IndexedDB",              "dir"),
-    # Local Storage MUST swap with the account. claude.ai stores the account
-    # identity here (accountUuid / account_uuid / token) — verified: it's the ONLY
-    # top-level store carrying accountUuid, and it's the one the app checks against
-    # the cookie. Leaving the outgoing account's Local Storage behind = cookie says
-    # B but Local Storage says A -> claude.ai shows the login page (even though the
-    # cookie is valid, which is why usage still works). REQUIRES a clean snapshot
-    # (Claude stopped during capture) or the copied leveldb is incomplete.
-    ("Local Storage",          "dir"),
-    ("Network/Cookies",        "file"),
-    ("Network/Cookies-journal", "file"),
-]
-
-# Shared, never swapped — Claude Code / agent-mode local session stores. On disk
-# they are keyed as <root>/<project>/<accountId>/<session>.json, so simply
-# switching the active account hides them. On every switch we MIRROR each
-# account's sessions into the incoming account's id folder, so the Claude Code
-# project list + history stay global across all profiles.
-CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
-
-# Local Storage is part of SESSION_ITEMS now (swapped per account), so a brand-new
-# login is already handled by the normal clear path — nothing extra to wipe.
-CLEAR_EXTRA: list = []
-
-USAGE_API   = "https://api.anthropic.com/api/oauth/usage"
-PROFILE_API = "https://api.anthropic.com/api/oauth/profile"
 
 MUTEX_NAME = "Local\\KaliClaudeProfileSwitcherV2"
 IPC_HOST   = "127.0.0.1"
 IPC_PORT   = 47323
-
-MAX_CONFIG_BACKUPS  = 15
-MAX_SESSION_BACKUPS = 5
 
 # ---------------------------------------------------------------------------
 # JSON / meta helpers
@@ -169,32 +133,6 @@ def _read_config() -> Optional[dict]:
     except Exception:
         return None
 
-def _backup_config() -> Optional[Path]:
-    if not CLAUDE_CONFIG.exists():
-        return None
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    dest = BACKUP_DIR / f"config.{ts}.json"
-    try:
-        dest.write_bytes(CLAUDE_CONFIG.read_bytes())
-    except OSError:
-        return None
-    # prune old backups
-    backups = sorted(BACKUP_DIR.glob("config.*.json"))
-    for old in backups[:-MAX_CONFIG_BACKUPS]:
-        try: old.unlink()
-        except OSError: pass
-    return dest
-
-def _write_config(cfg: dict) -> None:
-    """Back up then write config.json, preserving tab indentation."""
-    _backup_config()
-    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CLAUDE_CONFIG.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, indent="\t", ensure_ascii=False),
-                   encoding="utf-8")
-    tmp.replace(CLAUDE_CONFIG)
-
 def _live_blob() -> Optional[str]:
     """The live oauth token blob for the signed-in account, and the SINGLE source
     of truth for the live token everywhere (capture, restore, backup, fingerprint,
@@ -211,156 +149,13 @@ def _live_blob() -> Optional[str]:
             return blob
     return None
 
-def _fp(blob: Optional[str]) -> str:
-    if not blob:
-        return ""
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
-
 # ---------------------------------------------------------------------------
-# Session store — full per-profile snapshot of the Claude login.
-#
-# A login is the embedded claude.ai web session (Local Storage + Session
-# Storage + IndexedDB + cookies) PLUS the oauth token cache.  All copying and
-# swapping happens only while Claude is fully stopped, so databases are never
-# read or written under a live process.  Everything is backed up before being
-# overwritten, so any step is recoverable.
+# Profile-path helpers for explicit Rename/Remove UI actions. All snapshot
+# capture, validation, restoration, and history sync live in desktop_backend.py.
 # ---------------------------------------------------------------------------
 
 def _profile_dir(name: str) -> Path:
     return STORE_DIR / name
-
-def _session_root(name: str) -> Path:
-    return _profile_dir(name) / "session"
-
-def _oauth_path(name: str) -> Path:
-    return _profile_dir(name) / "oauth.blob"
-
-def _has_session(name: str) -> bool:
-    """True if a full web-session snapshot exists (not just an old token)."""
-    sr = _session_root(name)
-    return sr.exists() and ((sr / "IndexedDB").exists()
-                            or (sr / "Local Storage").exists())
-
-def _store_oauth(name: str, blob: str) -> None:
-    _profile_dir(name).mkdir(parents=True, exist_ok=True)
-    _oauth_path(name).write_text(blob, encoding="utf-8")
-
-def _load_blob(name: str) -> Optional[str]:
-    """Return the profile's stored oauth token blob (for usage / fingerprint).
-    Falls back to the legacy flat <name>.blob layout."""
-    for p in (_oauth_path(name), STORE_DIR / f"{name}.blob"):
-        try:
-            if p.exists():
-                return p.read_text(encoding="utf-8")
-        except OSError:
-            pass
-    return None
-
-def _copy_item(src_base: Path, dst_base: Path, rel: str, kind: str) -> None:
-    src = src_base / rel
-    dst = dst_base / rel
-    try:
-        if kind == "dir":
-            if src.exists():
-                if dst.exists():
-                    shutil.rmtree(dst, ignore_errors=True)
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-        else:
-            if src.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-    except Exception:
-        pass
-
-def _capture_session(name: str) -> None:
-    """Snapshot the live Claude session into the profile. Claude MUST be stopped —
-    otherwise the Cookies SQLite / leveldb stores are locked and copy incompletely."""
-    sr = _session_root(name)
-    if sr.exists():
-        shutil.rmtree(sr, ignore_errors=True)
-    sr.mkdir(parents=True, exist_ok=True)
-    for rel, kind in SESSION_ITEMS:
-        _copy_item(CLAUDE_DIR, sr, rel, kind)
-    # Guard: the login rides on the cookies. If the live Cookies exists but didn't
-    # make it into the snapshot, the copy was blocked (Claude still running) — fail
-    # loudly instead of saving a cookie-less snapshot that logs you out on switch.
-    live_ck = CLAUDE_DIR / "Network" / "Cookies"
-    snap_ck = sr / "Network" / "Cookies"
-    if live_ck.exists() and not snap_ck.exists():
-        raise RuntimeError(
-            "Could not copy the session cookies — Claude is still holding them. "
-            "Make sure Claude is fully closed, then try Update Snapshot again.")
-    blob = _live_blob()
-    if blob:
-        _store_oauth(name, blob)
-
-def _backup_live_session() -> Optional[Path]:
-    """Back up the current live session before overwriting/clearing it."""
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    dest = BACKUP_DIR / f"session-{ts}"
-    try:
-        dest.mkdir(parents=True, exist_ok=True)
-        for rel, kind in SESSION_ITEMS:
-            _copy_item(CLAUDE_DIR, dest, rel, kind)
-        b = _live_blob()
-        if b:
-            (dest / "oauth.blob").write_text(b, encoding="utf-8")
-    except Exception:
-        return None
-    for old in sorted(BACKUP_DIR.glob("session-*"))[:-MAX_SESSION_BACKUPS]:
-        shutil.rmtree(old, ignore_errors=True)
-    return dest
-
-def _restore_session(name: str) -> None:
-    """Replace the live Claude session with the profile's snapshot. Stopped only."""
-    sr = _session_root(name)
-    for rel, kind in SESSION_ITEMS:
-        live = CLAUDE_DIR / rel
-        snap = sr / rel
-        if kind == "dir":
-            if snap.exists():
-                if live.exists():
-                    shutil.rmtree(live, ignore_errors=True)
-                shutil.copytree(snap, live, dirs_exist_ok=True)
-            elif live.exists():
-                # Target snapshot lacks this store (e.g. a snapshot saved before
-                # Local Storage was captured). Clear the live copy so the target
-                # never inherits the OUTGOING account's Local Storage (a stale
-                # accountUuid is what pushes claude.ai to the login page). Better an
-                # empty store the app rebuilds from the cookie than a mismatched one.
-                shutil.rmtree(live, ignore_errors=True)
-        else:
-            if snap.exists():
-                live.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(snap, live)
-            elif live.exists():
-                try: live.unlink()
-                except OSError: pass
-    blob = _load_blob(name)
-    if blob:
-        cfg = _read_config() or {}
-        cfg[OAUTH_KEY_V2] = blob   # Claude Desktop reads the live token from V2 now
-        cfg[OAUTH_KEY]    = blob   # keep the legacy key in sync for older builds
-        _write_config(cfg)
-
-def _clear_live_session() -> None:
-    """Remove the live web session + token so Claude shows a fresh login. Stopped.
-    Local Storage is part of SESSION_ITEMS now, so it's cleared along with the rest."""
-    for rel, kind in list(SESSION_ITEMS) + CLEAR_EXTRA:
-        live = CLAUDE_DIR / rel
-        try:
-            if kind == "dir":
-                if live.exists():
-                    shutil.rmtree(live, ignore_errors=True)
-            elif live.exists():
-                live.unlink()
-        except OSError:
-            pass
-    cfg = _read_config()
-    if cfg and (OAUTH_KEY in cfg or OAUTH_KEY_V2 in cfg):
-        cfg.pop(OAUTH_KEY, None)
-        cfg.pop(OAUTH_KEY_V2, None)   # clear the live-read key too, or the old token lingers
-        _write_config(cfg)
 
 def _delete_profile_store(name: str) -> None:
     d = _profile_dir(name)
@@ -426,217 +221,14 @@ def _os_crypt_key() -> bytes:
     return _aes_key_cache
 
 
-def _decrypt_oauth(blob: Optional[str]) -> Optional[dict]:
-    if not (_CRYPTO_OK and blob):
-        return None
-    try:
-        raw = base64.b64decode(blob)
-        if raw[:3] != b"v10":
-            return None
-        pt = _AESGCM(_os_crypt_key()).decrypt(raw[3:15], raw[15:], None)
-        return json.loads(pt)
-    except Exception:
-        return None
+_DESKTOP_BACKEND: Optional[DesktopBackend] = None
 
 
-def _token_info(blob: Optional[str]) -> Optional[dict]:
-    """Extract {token, expiresAt, plan, tier} from a blob, preferring the
-    claude_code-scoped entry. Returns None if undecryptable."""
-    d = _decrypt_oauth(blob)
-    if not isinstance(d, dict):
-        return None
-    chosen = None
-    for k, v in d.items():
-        if isinstance(v, dict) and v.get("token"):
-            if "claude_code" in k:
-                chosen = v
-                break
-            chosen = chosen or v
-    if not chosen:
-        return None
-    return {
-        "token":     chosen.get("token"),
-        "expiresAt": chosen.get("expiresAt"),
-        "plan":      chosen.get("subscriptionType"),
-        "tier":      chosen.get("rateLimitTier"),
-    }
-
-
-def _account_id(blob: Optional[str]) -> Optional[str]:
-    """Account UUID for an oauth blob — the 2nd field of its token-cache key
-    (<orgId>:<accountId>:<apiUrl>:<scopes>). None if the blob can't be decrypted
-    (e.g. crypto unavailable), in which case mirroring is simply skipped."""
-    d = _decrypt_oauth(blob)
-    if not isinstance(d, dict):
-        return None
-    for k in d:
-        parts = k.split(":")
-        if len(parts) >= 2 and len(parts[1]) >= 8:
-            return parts[1]
-    return None
-
-
-def _known_account_ids() -> set:
-    """Every account id we can see — across saved profiles and the live login."""
-    ids: set = set()
-    for nm in _load_meta().get("profiles", {}):
-        a = _account_id(_load_blob(nm))
-        if a:
-            ids.add(a)
-    a = _account_id(_live_blob())
-    if a:
-        ids.add(a)
-    return ids
-
-
-def _log_pairs() -> dict:
-    """root_name -> set of (workspace, account) folders Claude Code has loaded or
-    tried to load, parsed from main.log. Crucially this reveals the folder a
-    freshly added account reads *before* it has any sessions on disk, so we can
-    create and seed it. (An account/org can use several workspace ids.)"""
-    out = {r: set() for r in CC_SESSION_ROOTS}
-    try:
-        text = CLAUDE_LOG.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return out
-    for line in text.splitlines():
-        if "persisted sessions from" not in line and "does not exist yet" not in line:
-            continue
-        for root_name in CC_SESSION_ROOTS:
-            if root_name not in line:
-                continue
-            tail = line.split(root_name, 1)[1].replace("/", "\\")
-            segs = [s for s in tail.split("\\") if s]
-            if len(segs) >= 2:
-                out[root_name].add((segs[0], segs[1]))
-            break
-    return out
-
-
-def _backup_cc_roots(tag: str) -> None:
-    """Snapshot the Claude Code / agent-mode session roots before a destructive
-    step (deletion propagation). Pruned like the other session backups."""
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    dest = BACKUP_DIR / f"cc-{tag}-{ts}"
-    try:
-        for root_name in CC_SESSION_ROOTS:
-            src = CLAUDE_DIR / root_name
-            if src.exists():
-                shutil.copytree(src, dest / root_name, dirs_exist_ok=True)
-    except Exception:
-        return
-    for old in sorted(BACKUP_DIR.glob("cc-*"))[:-MAX_SESSION_BACKUPS]:
-        shutil.rmtree(old, ignore_errors=True)
-
-
-def _session_targets(accounts: set, log_pairs: dict) -> list:
-    """Every (root_name, root, folder, key) belonging to one of our accounts —
-    from BOTH existing on-disk folders AND the load paths in the log. Seeding all
-    of them means each login (including a brand-new account that has only just
-    touched Claude Code, with an empty or not-yet-created folder) gets the merged
-    history in the exact folder it reads."""
-    out = []
-    for root_name in CC_SESSION_ROOTS:
-        root = CLAUDE_DIR / root_name
-        pairs = set(log_pairs.get(root_name, set()))
-        if root.exists():
-            for ws in root.iterdir():
-                if ws.is_dir():
-                    for acc in ws.iterdir():
-                        if acc.is_dir():
-                            pairs.add((ws.name, acc.name))
-        for ws, acc in pairs:
-            if acc in accounts:
-                out.append((root_name, root, root / ws / acc, f"{root_name}/{ws}/{acc}"))
-    return out
-
-
-def sync_cc_histories() -> dict:
-    """Make Claude Code + agent-mode history global across profiles, with
-    deletions honoured. EVERY folder our accounts load (<root>/<workspace>/
-    <accountId>, discovered from disk + the log so even brand-new accounts are
-    covered) is brought to the UNION of every account's sessions — except
-    conversations the user has since deleted, which are detected (gone from a
-    folder we previously wrote them to), swept from every folder, and not
-    re-added. Additive otherwise, keep-newest. Claude must be stopped.
-    Returns {'added': N, 'deleted': N}."""
-    accounts = _known_account_ids()
-    manifest = _load_json(CC_SYNC_MANIFEST)     # {folder_key: [basenames]}
-    targets = _session_targets(accounts, _log_pairs())
-    report = {"added": 0, "deleted": 0}
-
-    # 1. Detect user deletions: sessions we distributed to a target folder last
-    #    time that are now missing from it (Claude removed them on delete).
-    deleted: set = set()
-    for _rn, _root, folder, key in targets:
-        prev = set(manifest.get(key, []))
-        cur = {p.name for p in folder.glob("*.json")} if folder.exists() else set()
-        deleted |= (prev - cur)
-
-    # 2. Propagate deletions: sweep tombstoned sessions from EVERY folder so the
-    #    next union can't resurrect them.
-    if deleted:
-        _backup_cc_roots("predelete")
-        for root_name in CC_SESSION_ROOTS:
-            root = CLAUDE_DIR / root_name
-            if not root.exists():
-                continue
-            for p in root.glob("*/*/*.json"):
-                if p.name in deleted:
-                    try:
-                        p.unlink()
-                        report["deleted"] += 1
-                    except OSError:
-                        pass
-
-    # 3. Distribute the surviving union into each managed folder.
-    new_manifest: dict = {}
-    for root_name in CC_SESSION_ROOTS:
-        root = CLAUDE_DIR / root_name
-        if not root.exists():
-            continue
-        union: dict = {}                        # basename -> newest source path
-        for p in root.glob("*/*/*.json"):
-            if p.name in deleted:
-                continue
-            cur = union.get(p.name)
-            try:
-                if cur is None or p.stat().st_mtime > cur.stat().st_mtime:
-                    union[p.name] = p
-            except OSError:
-                pass
-        for rn, _root, folder, key in targets:
-            if rn != root_name:
-                continue
-            folder.mkdir(parents=True, exist_ok=True)
-            for name, src in union.items():
-                out = folder / name
-                try:
-                    if not out.exists() or src.stat().st_mtime > out.stat().st_mtime:
-                        shutil.copy2(src, out)
-                        report["added"] += 1
-                except OSError:
-                    pass
-            new_manifest[key] = sorted(union.keys())
-
-    _save_json(CC_SYNC_MANIFEST, new_manifest)
-    return report
-
-
-def _api_get(url: str, token: str, timeout: int = 15) -> dict:
-    req = urllib.request.Request(url, method="GET", headers={
-        "Authorization":    f"Bearer {token}",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta":    "oauth-2025-04-20",
-        "User-Agent":        "KaliClaude/2.1",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        return {"_http_error": e.code}
-    except Exception as e:
-        return {"_error": str(e)}
+def _desktop_backend() -> DesktopBackend:
+    global _DESKTOP_BACKEND
+    if _DESKTOP_BACKEND is None:
+        _DESKTOP_BACKEND = DesktopBackend()
+    return _DESKTOP_BACKEND
 
 
 # ---------------------------------------------------------------------------
@@ -843,23 +435,9 @@ def _until_str(iso: Optional[str]) -> str:
 _NOWIN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 def _desktop_claude_pids() -> list:
-    """PIDs of the Claude DESKTOP app ONLY.
-
-    CRITICAL: Claude Code (the CLI/agent) also runs as `claude.exe`, from
-    ...\\Roaming\\Claude\\claude-code\\...  — so matching by image name alone
-    conflates the two. That made 'is Claude stopped?' never true (Claude Code is
-    always running), so the snapshot ran while the Desktop app still held the
-    Cookies file locked -> a cookie-less snapshot -> login after switch. It also
-    risked force-killing the user's Claude Code session. We match the DESKTOP app
-    by executable path and explicitly exclude `claude-code`."""
+    """PIDs of Claude Desktop only; UI polling treats detection errors as unknown."""
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
-             "Where-Object { $_.ExecutablePath -and $_.ExecutablePath -notmatch 'claude-code' } | "
-             "Select-Object -ExpandProperty ProcessId"],
-            capture_output=True, text=True, timeout=10, creationflags=_NOWIN)
-        return [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+        return _desktop_backend().desktop_pids()
     except Exception:
         return []
 
@@ -867,33 +445,7 @@ def _claude_running() -> bool:
     return len(_desktop_claude_pids()) > 0
 
 def _kill_claude() -> None:
-    """Stop the Claude DESKTOP app (never Claude Code). Graceful close first
-    (WM_CLOSE) so Electron flushes + releases the Cookies/session DBs; force-kill
-    only desktop stragglers after a grace period. Targets specific PIDs so this
-    can never touch the user's Claude Code session."""
-    pids = _desktop_claude_pids()
-    if not pids:
-        return
-    for pid in pids:                       # graceful: WM_CLOSE per desktop PID
-        subprocess.run(["taskkill", "/PID", str(pid)],
-                       capture_output=True, creationflags=_NOWIN)
-    deadline = time.time() + 6.0
-    while time.time() < deadline:
-        if not _desktop_claude_pids():
-            break
-        time.sleep(0.3)
-    for pid in _desktop_claude_pids():     # force only desktop stragglers
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, creationflags=_NOWIN)
-    time.sleep(0.8)                        # let the OS release file handles
-
-def _wait_stopped(timeout: float = 6.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not _claude_running():
-            return True
-        time.sleep(0.3)
-    return not _claude_running()
+    _desktop_backend().stop_desktop()
 
 def _detect_aumid() -> Optional[str]:
     try:
@@ -958,10 +510,11 @@ def _start_ipc(on_focus) -> None:
 
 class Profile:
     __slots__ = ("name", "label", "note", "updated", "fp", "is_active",
-                 "has_blob", "email", "plan", "usage")
+                 "has_blob", "email", "plan", "usage", "state", "issue")
 
     def __init__(self, name, label, note, updated, fp, is_active, has_blob,
-                 email="", plan="", usage=None):
+                 email="", plan="", usage=None, state=ProfileState.READY,
+                 issue=""):
         self.name = name
         self.label = label
         self.note = note
@@ -972,23 +525,38 @@ class Profile:
         self.email = email
         self.plan = plan
         self.usage = usage or {}
+        self.state = state
+        self.issue = issue
+
+
+PROFILE_STATE_LABELS = {
+    ProfileState.ACTIVE: "Active",
+    ProfileState.READY: "Ready",
+    ProfileState.NEEDS_RELOGIN: "Needs re-login",
+    ProfileState.CORRUPT: "Corrupt",
+    ProfileState.UNKNOWN_LIVE_LOGIN: "Unknown live login",
+}
 
 def _list_profiles() -> list[Profile]:
     m = _load_meta()
-    active = m.get("active")
     out: list[Profile] = []
-    for name, info in sorted(m.get("profiles", {}).items()):
+    for saved in _desktop_backend().list_profiles():
+        name = saved.name
+        info = m.get("profiles", {}).get(name, {})
+        ready = saved.state in (ProfileState.ACTIVE, ProfileState.READY)
         out.append(Profile(
             name=name,
-            label=info.get("label", ""),
-            note=info.get("note", ""),
-            updated=info.get("updated", 0),
-            fp=info.get("fp", ""),
-            is_active=(name == active),
-            has_blob=_has_session(name),
+            label=saved.label,
+            note=saved.note,
+            updated=saved.updated,
+            fp=info.get("fp", saved.account_id_hash[:12]),
+            is_active=(saved.state == ProfileState.ACTIVE),
+            has_blob=ready,
             email=info.get("email", ""),
             plan=info.get("plan", ""),
             usage=info.get("usage") or {},
+            state=saved.state,
+            issue=saved.issue,
         ))
     return out
 
@@ -1052,19 +620,49 @@ class App:
         self._sel = -1
         self._q: queue.Queue = queue.Queue()
         self._claude_up = False
+        self._claude_detection_error = False
         self._live_present = False
         self._note_pending = False
         self._busy = False
         self._usage_busy = False
-        self._switch_ctx: dict = {}
+        self._startup_error = ""
+        self._migration_report = None
+
+        try:
+            self._migration_report = _desktop_backend().audit_and_migrate()
+        except Exception as error:
+            self._startup_error = str(error)
 
         self._build()
         _start_ipc(lambda: self.root.after(0, self._focus))
         self.root.after(200, self._refresh)
         self.root.after(1500, self._tick)
         self.root.after(150, self._pump)
+        self.root.after(350, self._show_startup_audit)
         # detect & cache AUMID in background
         threading.Thread(target=self._ensure_aumid, daemon=True).start()
+
+    def _show_startup_audit(self):
+        if self._startup_error:
+            messagebox.showerror(
+                "Profile Audit Failed",
+                "KaliClaude could not safely audit the saved profiles. Switching "
+                f"is unavailable until this is fixed.\n\n{self._startup_error}",
+                parent=self.root,
+            )
+            return
+        report = self._migration_report
+        blocked = list(report.needs_relogin) + list(report.corrupt) if report else []
+        if blocked:
+            backup = f"\n\nRecovery backup:\n{report.backup.path}" if report.backup else ""
+            messagebox.showwarning(
+                "Profiles Need Attention",
+                "The profile audit preserved but blocked these snapshots:\n\n"
+                + "\n".join(f"• {name}" for name in blocked)
+                + "\n\nSign in again and use Update Snapshot for each blocked profile."
+                + backup,
+                parent=self.root,
+            )
 
     def _ensure_aumid(self):
         m = _load_meta()
@@ -1337,11 +935,14 @@ class App:
         if sub:
             tk.Label(inner, text=sub, bg=cbg, fg=TXT_MUTE, font=(FF, 8),
                      anchor="w").pack(fill=tk.X, pady=(2, 0))
-        meta = f"saved {_rel_time(p.updated)}"
-        if not p.has_blob:
-            meta = "⚠ snapshot missing"
+        if p.state == ProfileState.ACTIVE:
+            meta, meta_color = "Active", CLR_ACTIVE
+        elif p.state == ProfileState.READY:
+            meta, meta_color = f"Ready · saved {_rel_time(p.updated)}", TXT_MUTE
+        else:
+            meta, meta_color = PROFILE_STATE_LABELS[p.state], CLR_WARN
         tk.Label(inner, text=meta, bg=cbg,
-                 fg=CLR_WARN if not p.has_blob else TXT_MUTE,
+                 fg=meta_color,
                  font=(FF, 7), anchor="w").pack(fill=tk.X, pady=(3, 0))
 
         for w in self._all(outer) + [outer]:
@@ -1383,9 +984,14 @@ class App:
             self._active_badge.pack_forget()
         self._email_row.configure(text=p.email or "— (refresh usage to fetch)")
         self._plan_row.configure(text=p.plan or "—")
+        snapshot_text = PROFILE_STATE_LABELS[p.state]
+        if p.has_blob:
+            snapshot_text += f" · {_rel_time(p.updated)}"
+        elif p.issue:
+            snapshot_text += " · validation failed"
         self._saved_row.configure(
-            text=_rel_time(p.updated) if p.has_blob else "⚠ missing",
-            fg=CLR_WARN if not p.has_blob else TXT_SUB)
+            text=snapshot_text,
+            fg=TXT_SUB if p.has_blob else CLR_WARN)
         self._note.delete("1.0", tk.END); self._note.insert("1.0", p.note)
         self._note_saved.configure(text="")
         self._render_usage(p)
@@ -1395,9 +1001,9 @@ class App:
                                        bg=BG_CARD, fg=TXT_MUTE,
                                        activebackground=BG_CARD)
         elif not p.has_blob:
-            self._btn_switch.configure(text="No Snapshot", state=tk.DISABLED,
-                                       bg=BG_CARD, fg=TXT_MUTE,
-                                       activebackground=BG_CARD)
+            self._btn_switch.configure(text="Re-login / Re-save", state=tk.NORMAL,
+                                       bg=CLR_ACCENT, fg="#17140F",
+                                       activebackground="#BF6330")
         else:
             self._btn_switch.configure(text="Switch to this Profile",
                                        state=tk.NORMAL, bg=CLR_ACCENT,
@@ -1448,7 +1054,11 @@ class App:
             text="Refresh Usage")
 
     def _refresh_claude_ui(self):
-        if self._claude_up:
+        if self._claude_detection_error:
+            self._claude_lbl.configure(text="⚠ Claude status unavailable", fg=CLR_WARN)
+            self._btn_launch.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
+            self._btn_stop.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
+        elif self._claude_up:
             self._claude_lbl.configure(text="● Claude is running", fg=CLR_OK)
             self._btn_launch.configure(state=tk.DISABLED, bg=BG_CARD, fg=TXT_MUTE)
             self._btn_stop.configure(state=tk.NORMAL, bg="#3D1F1F", fg=CLR_ERR)
@@ -1466,22 +1076,33 @@ class App:
         self._render_list()
         self._show_detail(self._profiles[self._sel]
                           if 0 <= self._sel < len(self._profiles) else None)
-        m = _load_meta()
-        active = m.get("active")
+        active = next((p.name for p in self._profiles if p.is_active), None)
         n = len(self._profiles)
-        self._set_status(f"{n} profile{'s' if n != 1 else ''}"
-                         + (f"  ·  Active: {active}" if active else ""))
+        live_status = (
+            f"  ·  Active: {active}"
+            if active
+            else ("  ·  Unknown live login" if _live_blob() else "")
+        )
+        self._set_status(f"{n} profile{'s' if n != 1 else ''}" + live_status)
 
     def _tick(self):
         def check():
-            up = _claude_running()
+            try:
+                up = _desktop_backend().desktop_running()
+                detection_error = False
+            except Exception:
+                up = False
+                detection_error = True
             live = _live_blob() is not None
-            self.root.after(0, lambda: self._apply_tick(up, live))
+            self.root.after(
+                0, lambda: self._apply_tick(up, live, detection_error)
+            )
         threading.Thread(target=check, daemon=True).start()
         self.root.after(5000, self._tick)
 
-    def _apply_tick(self, up, live):
+    def _apply_tick(self, up, live, detection_error=False):
         self._claude_up = up
+        self._claude_detection_error = detection_error
         self._live_present = live
         self._live_lbl.configure(
             text="● session detected" if live else "○ not logged in",
@@ -1516,7 +1137,7 @@ class App:
         # itself uses — indistinguishable from normal usage. We never read a
         # non-active profile's stored token, which is the cross-account pattern
         # that could look anomalous. Non-active profiles show their last cache.
-        if self._usage_busy or not (0 <= self._sel < len(self._profiles)):
+        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         if not _CRYPTO_OK:
             messagebox.showwarning(
@@ -1565,7 +1186,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_save_current(self):
-        if self._busy:
+        if self._busy or self._usage_busy:
             return
         if not _live_blob():
             messagebox.showwarning(
@@ -1593,20 +1214,7 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close — try again or stop it manually.")
-                _capture_session(name)   # Claude stopped → clean, complete snapshot
-                blob = _load_blob(name)
-                m = _load_meta()
-                info = m["profiles"].get(name, {})
-                info.update(label=label, note=note, updated=time.time(),
-                            fp=_fp(blob))
-                info.setdefault("created", time.time())
-                m["profiles"][name] = info
-                m["active"] = name
-                _save_meta(m)
+                _desktop_backend().capture_current(name, label, note)
                 self._q.put(("save_ok", name))
             except Exception as e:
                 self._q.put(("save_err", str(e)))
@@ -1614,7 +1222,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update(self):
-        if self._busy or not (0 <= self._sel < len(self._profiles)):
+        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         p = self._profiles[self._sel]
         if not _live_blob():
@@ -1636,17 +1244,7 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close — try again or stop it manually.")
-                _capture_session(name)   # Claude stopped → clean, complete snapshot
-                blob = _load_blob(name)
-                m = _load_meta()
-                info = m["profiles"].setdefault(name, {})
-                info.update(updated=time.time(), fp=_fp(blob))
-                m["active"] = name
-                _save_meta(m)
+                _desktop_backend().capture_current(name, p.label, p.note)
                 self._q.put(("save_ok", name))
             except Exception as e:
                 self._q.put(("save_err", str(e)))
@@ -1654,10 +1252,13 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_switch(self):
-        if self._busy or not (0 <= self._sel < len(self._profiles)):
+        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         p = self._profiles[self._sel]
-        if p.is_active or not p.has_blob:
+        if p.is_active:
+            return
+        if not p.has_blob:
+            self._on_relogin_profile(p)
             return
         running = _claude_running()
         msg = f"Switch Claude to profile  '{p.name}'?"
@@ -1672,77 +1273,36 @@ class App:
         self._set_status(f"Switching to {p.name}…")
         target = p.name
 
-        # Phase 1 (worker): stop Claude, then read the outgoing token and decide
-        # whether its snapshot needs refreshing — WITHOUT writing anything. The
-        # main thread handles any prompt (Tk isn't thread-safe), then phase 2 commits.
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError(
-                            "Claude did not close — try again or stop it manually.")
-                m = _load_meta()
-                # Phase 2 will capture the outgoing account's current session before
-                # restoring the target (sessionKey rotates in use — keep it fresh).
-                self._switch_ctx = {"target": target, "active": m.get("active")}
-                self._q.put(("switch_phase1", {}))
+                result = _desktop_backend().switch(target)
+                self._q.put(("switch_ok", result))
+            except RollbackError as error:
+                self._q.put(("rollback_err", (str(error), str(error.recovery_path))))
             except Exception as e:
                 self._q.put(("switch_err", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _start_switch_phase2(self):
-        """Commit the switch: optionally re-capture the outgoing full session,
-        back up the live session, then restore the target's full session."""
-        ctx = self._switch_ctx
-
-        def work():
-            try:
-                m = _load_meta()
-                # Capture the OUTGOING account's CURRENT session first (Claude is
-                # already stopped, so this is a clean capture). claude.ai ROTATES the
-                # sessionKey while an account is in use — a stale snapshot holds a
-                # superseded key the server rejects on the next switch back, which is
-                # the intermittent "logged out after switch". Re-capturing on
-                # switch-away keeps each account's snapshot key current. This is what
-                # the old working version did; removing it (restore-only) broke it.
-                out = ctx.get("active")
-                if out and out != ctx["target"] and out in m["profiles"] and _live_blob():
-                    _capture_session(out)
-                    b = _load_blob(out)
-                    m["profiles"][out].update(updated=time.time(), fp=_fp(b))
-                if not _has_session(ctx["target"]):
-                    raise RuntimeError(
-                        f"'{ctx['target']}' has no full-session snapshot. "
-                        "Switch to it once and use 'Update Snapshot', or re-save it.")
-                _backup_live_session()
-                _restore_session(ctx["target"])
-                # Merge Claude Code / agent-mode history across all accounts so
-                # the incoming profile sees the combined project list + sessions.
-                try:
-                    sync_cc_histories()
-                except Exception:
-                    pass
-                m["active"] = ctx["target"]
-                _save_meta(m)
-                self._q.put(("switch_ok", ctx["target"]))
-            except Exception as e:
-                self._q.put(("switch_err", str(e)))
-
-        threading.Thread(target=work, daemon=True).start()
+    def _on_relogin_profile(self, profile: Profile):
+        reason = f"\n\nReason: {profile.issue}" if profile.issue else ""
+        if messagebox.askyesno(
+            "Re-login Required",
+            f"'{profile.name}' cannot be restored because its saved login is "
+            f"incomplete or invalid.{reason}\n\nPrepare a fresh Claude login now? After "
+            "signing in, select this profile and click 'Update Snapshot'.",
+            parent=self.root,
+        ):
+            self._on_prepare_login()
 
     def _on_prepare_login(self):
         """Capture the current session (optional), then CLEAR the live web
         session + token so Claude shows a genuine fresh login screen. Saved
         profiles remain valid and restorable."""
-        if self._busy:
+        if self._busy or self._usage_busy:
             return
         save_req = None
-        m0 = _load_meta()
-        active = m0.get("active")
-        already_saved = bool(active and active in m0["profiles"]
-                             and _has_session(active))
+        already_saved = any(p.is_active and p.has_blob for p in self._profiles)
         # Only offer to save the current login if it isn't already captured
         # (e.g. you just used "Save Current Login"). No nagging otherwise.
         if _live_blob() and not already_saved:
@@ -1773,27 +1333,13 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close.")
                 if save_req:
                     sname, slabel, snote = save_req
-                    _capture_session(sname)
-                    blob = _load_blob(sname)
-                    m = _load_meta()
-                    info = m["profiles"].get(sname, {})
-                    info.update(label=slabel, note=snote, updated=time.time(),
-                                fp=_fp(blob))
-                    info.setdefault("created", time.time())
-                    m["profiles"][sname] = info
-                    _save_meta(m)
-                _backup_live_session()
-                _clear_live_session()
-                m = _load_meta()
-                m["active"] = None
-                _save_meta(m)
-                self._q.put(("prep_ok", None))
+                    _desktop_backend().capture_current(sname, slabel, snote)
+                backup = _desktop_backend().prepare_new_login()
+                self._q.put(("prep_ok", str(backup.path)))
+            except RollbackError as error:
+                self._q.put(("prep_recovery", (str(error), str(error.recovery_path))))
             except Exception as e:
                 self._q.put(("prep_err", str(e)))
 
@@ -1803,13 +1349,14 @@ class App:
         """Merge Claude Code + agent-mode history across every account so all
         profiles share one project list / session history. Closes Claude first
         (file safety), then redistributes the union into each account's folder."""
-        if self._busy:
+        if self._busy or self._usage_busy:
             return
         if not messagebox.askyesno(
             "Sync Claude Code History",
             "Merge every account's Claude Code + agent-mode sessions so the "
             "combined project list and history are visible under any profile.\n\n"
-            "• Additive only — nothing is deleted, newest copy wins.\n"
+            "• Newest copy wins; user-deleted conversations stay deleted.\n"
+            "• A local history backup is made before deletions propagate.\n"
             "• Claude will be closed first if it's running.\n\n"
             "Continue?", parent=self.root):
             return
@@ -1818,12 +1365,13 @@ class App:
 
         def work():
             try:
-                if _claude_running():
-                    _kill_claude()
-                    if not _wait_stopped(6.0):
-                        raise RuntimeError("Claude did not close.")
-                report = sync_cc_histories()
-                self._q.put(("sync_ok", report))
+                report = _desktop_backend().sync_histories()
+                if not report.ok:
+                    raise RuntimeError(report.message or "History sync failed")
+                self._q.put(("sync_ok", {
+                    "added": report.added,
+                    "deleted": report.removed,
+                }))
             except Exception as e:
                 self._q.put(("sync_err", str(e)))
 
@@ -1840,19 +1388,36 @@ class App:
         self.root.after(150, self._pump)
 
     def _handle_result(self, kind, data):
-        if kind == "switch_phase1":
-            # Restore-only switch: no outgoing re-capture, no prompt — go commit.
-            self._start_switch_phase2()
-        elif kind == "switch_ok":
+        if kind == "switch_ok":
             self._busy = False
-            self._set_status(f"Switched to '{data}'.")
+            result: SwitchResult = data
+            target = result.target_name
+            self._set_status(f"Switched to '{target}'.")
             self._refresh()
+            if result.history and not result.history.ok:
+                messagebox.showwarning(
+                    "Login Switched; History Not Synced",
+                    "The Claude login switch succeeded and remains active, but "
+                    f"history sync failed:\n\n{result.history.message}",
+                    parent=self.root,
+                )
             if messagebox.askyesno(
                 "Launch Claude",
-                f"Now signed in as '{data}'.\n\nLaunch Claude?",
+                f"Now signed in as '{target}'.\n\nLaunch Claude?",
                 parent=self.root):
                 _launch_claude(_load_meta().get("aumid"))
                 self._set_status("Launching Claude…")
+        elif kind == "rollback_err":
+            self._busy = False
+            message, recovery = data
+            messagebox.showerror(
+                "Switch Recovery Required",
+                f"{message}\n\nDo not launch Claude Desktop. The verified recovery "
+                f"backup is here:\n\n{recovery}",
+                parent=self.root,
+            )
+            self._set_status(f"Recovery required — backup: {recovery}")
+            self._refresh()
         elif kind == "switch_err":
             self._busy = False
             messagebox.showerror("Switch Failed", data, parent=self.root)
@@ -1895,6 +1460,17 @@ class App:
             messagebox.showerror("Prepare Failed", data, parent=self.root)
             self._set_status(f"Prepare failed: {data}")
             self._refresh()
+        elif kind == "prep_recovery":
+            self._busy = False
+            message, recovery = data
+            messagebox.showerror(
+                "New Login Recovery Required",
+                f"{message}\n\nDo not launch Claude Desktop. The verified recovery "
+                f"backup is here:\n\n{recovery}",
+                parent=self.root,
+            )
+            self._set_status(f"Recovery required — backup: {recovery}")
+            self._refresh()
         elif kind == "sync_ok":
             self._busy = False
             added = (data or {}).get("added", 0)
@@ -1936,7 +1512,7 @@ class App:
                 self._render_usage(self._profiles[self._sel])
 
     def _on_rename(self):
-        if not (0 <= self._sel < len(self._profiles)):
+        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         p = self._profiles[self._sel]
         existing = [x.name for x in self._profiles if x.name != p.name]
@@ -1965,7 +1541,7 @@ class App:
                 self._select(i); break
 
     def _on_remove(self):
-        if not (0 <= self._sel < len(self._profiles)):
+        if self._busy or self._usage_busy or not (0 <= self._sel < len(self._profiles)):
             return
         p = self._profiles[self._sel]
         if p.is_active:
@@ -1994,6 +1570,10 @@ class App:
 
     def _save_note(self):
         self._note_pending = False
+        if self._busy or self._usage_busy:
+            self._note_pending = True
+            self.root.after(500, self._save_note)
+            return
         if not (0 <= self._sel < len(self._profiles)):
             return
         p = self._profiles[self._sel]
@@ -2006,15 +1586,24 @@ class App:
         self.root.after(1800, lambda: self._note_saved.configure(text=""))
 
     def _on_launch(self):
+        if self._busy or self._usage_busy:
+            return
         m = _load_meta()
         _launch_claude(m.get("aumid"))
         self._set_status("Launching Claude…")
 
     def _on_stop(self):
-        if not messagebox.askyesno("Stop Claude", "Force-close Claude Desktop?",
+        if self._busy or self._usage_busy:
+            return
+        if not messagebox.askyesno("Stop Claude", "Close Claude Desktop?",
                                    parent=self.root):
             return
-        _kill_claude()
+        try:
+            _kill_claude()
+        except Exception as error:
+            messagebox.showerror("Stop Failed", str(error), parent=self.root)
+            self._set_status(f"Stop failed: {error}")
+            return
         self._claude_up = False
         self._refresh_claude_ui()
         self._set_status("Claude stopped.")
