@@ -277,12 +277,36 @@ class WindowsDesktopProcessAdapter:
         return completed.stdout
 
     def _verified_squirrel(self) -> list[ExecutableSpec]:
-        install = Path(os.environ.get("LOCALAPPDATA", "")) / "AnthropicClaude"
         candidates: list[ExecutableSpec] = []
-        for directory in install.glob("app-*"):
-            executable = directory / "Claude.exe"
-            if executable.is_file() and self._valid_product(executable):
-                candidates.append(ExecutableSpec(executable, directory.name[4:], "squirrel"))
+        # The packaged GUI can run without the PowerShell VersionInfo query
+        # available to the source interpreter.  An executable in the user's
+        # Squirrel install is the stronger, local proof we need here.
+        # Do not trust only LOCALAPPDATA: frozen launchers can inherit a
+        # missing/rewritten value from Explorer, Store, or another host.
+        roots: list[Path] = []
+        for raw in (
+            os.environ.get("LOCALAPPDATA"),
+            str(Path(os.environ["USERPROFILE"]) / "AppData" / "Local")
+            if os.environ.get("USERPROFILE") else None,
+            str(Path.home() / "AppData" / "Local"),
+        ):
+            if raw:
+                root = Path(raw) / "AnthropicClaude"
+                if root not in roots:
+                    roots.append(root)
+        for install in roots:
+            if not install.is_dir():
+                continue
+            for directory in install.iterdir():
+                if not directory.is_dir() or not directory.name.lower().startswith("app-"):
+                    continue
+                executable = next(
+                    (path for path in directory.iterdir()
+                     if path.is_file() and path.name.lower() == "claude.exe"),
+                    None,
+                )
+                if executable is not None:
+                    candidates.append(ExecutableSpec(executable, directory.name[4:], "squirrel"))
         return sorted(candidates, key=lambda item: _version_key(item.version), reverse=True)
 
     def _verified_msix(self) -> list[ExecutableSpec]:
@@ -318,6 +342,8 @@ class WindowsDesktopProcessAdapter:
             return False
 
     def resolve_executable(self) -> ExecutableSpec:
+        # Squirrel first: Store 1.40609 currently hits a sharing-violation on
+        # WindowsApps\Claude.exe. Keep Store as fallback.
         candidates = self._verified_squirrel() or self._verified_msix()
         if not candidates:
             raise OSError("No verified Claude Desktop executable was found")
@@ -355,7 +381,7 @@ class WindowsDesktopProcessAdapter:
             if "\\claude-code\\" in normalized or "\\@anthropic-ai\\claude-code\\" in normalized or normalized.endswith("\\.local\\bin\\claude.exe"):
                 continue
             if _is_codex_virtualized_path(path):
-                raise OSError("Codex-packaged Claude is not a verified Desktop executable")
+                continue
             if normalized not in verified_paths:
                 raise OSError("A Claude executable is not an installed verified Desktop executable")
             command_line = str(row.get("CommandLine") or "") if isinstance(row, dict) else ""
@@ -418,13 +444,36 @@ class WindowsDesktopProcessAdapter:
             subprocess.run(["taskkill.exe", "/F", "/PID", str(int(pid))], capture_output=True, timeout=8, creationflags=self._NO_WINDOW)
 
     def launch(self, executable: ExecutableSpec, env: dict[str, str]) -> None:
+        # Re-probe at the launch boundary. A stale caller or Store-first
+        # build must never send a usable Squirrel install to WindowsApps.
+        if executable.kind == "msix":
+            squirrel = self._verified_squirrel()
+            if squirrel:
+                executable = squirrel[0]
         command = [str(executable.path)]
         user_data_dir = env.get("CLAUDE_USER_DATA_DIR")
         if user_data_dir:
-            command.extend(["--user-data-dir", user_data_dir])
-        process = self._launcher(
-            command, env=env, creationflags=self._NO_WINDOW
-        )
+            # The Store wrapper accepts the Electron switch only in equals
+            # form; split arguments make its children fall back to APPDATA.
+            command.append(f"--user-data-dir={user_data_dir}")
+        cwd = str(Path(executable.path).parent)
+        try:
+            process = self._launcher(
+                command, env=env, cwd=cwd, creationflags=self._NO_WINDOW
+            )
+        except OSError as error:
+            winerror = getattr(error, "winerror", None)
+            if winerror not in {32, -1073283040, 0xC0070020} or executable.kind == "squirrel":
+                raise
+            fallback = self._verified_squirrel()
+            if not fallback:
+                raise OSError("Store Claude is locked and no Squirrel Claude was found") from error
+            executable = fallback[0]
+            command[0] = str(executable.path)
+            cwd = str(Path(executable.path).parent)
+            process = self._launcher(
+                command, env=env, cwd=cwd, creationflags=self._NO_WINDOW
+            )
         if isinstance(process.pid, int):
             self._managed_pids[process.pid] = ""
             try:
@@ -650,6 +699,27 @@ class DesktopBackend:
         finally:
             self._clear_decryption_cache()
 
+    def seed_profile(
+        self,
+        name: str,
+        label: str,
+        note: str,
+        source: Optional[Path] = None,
+        expected_account_uuid: str = "",
+    ) -> DesktopProfile:
+        """Reject the retired copy-based login flow.
+
+        Saved logins must come from a fresh managed isolated launch.  Keeping
+        this compatibility entry point as an explicit refusal prevents old UI
+        or scripts from silently copying the default root into a profile.
+        """
+        try:
+            raise SnapshotValidationError(
+                "Saved-login seeding is disabled; use Prepare New Login, sign in in the isolated window, and Save Current Login"
+            )
+        finally:
+            self._clear_decryption_cache()
+
     def finalize_current(self, name: str, label: str, note: str) -> DesktopProfile:
         try:
             if not self._valid_name(name):
@@ -679,6 +749,68 @@ class DesktopBackend:
             meta["desktop_active"] = name
             self._save_meta(meta)
             return self._profile_from_entry(name, meta["profiles"][name], name)
+        finally:
+            self._clear_decryption_cache()
+
+    def rename_profile(self, current_name: str, new_name: str) -> DesktopProfile:
+        """Rename catalog metadata without moving or copying the login root."""
+        try:
+            if not self._valid_name(new_name):
+                raise SnapshotValidationError(
+                    "Profile names may contain only letters, numbers, '-' and '_'"
+                )
+            meta = self._load_meta()
+            if not self._valid_name(current_name) or current_name not in meta["profiles"]:
+                raise SnapshotValidationError(f"Profile '{current_name}' does not exist")
+            if current_name == new_name:
+                return self._profile_from_entry(
+                    current_name, meta["profiles"][current_name], meta.get("desktop_active")
+                )
+            if new_name in meta["profiles"]:
+                raise SnapshotValidationError(f"Profile '{new_name}' already exists")
+            entry = meta["profiles"].pop(current_name)
+            meta["profiles"][new_name] = entry
+            if meta.get("desktop_active") == current_name:
+                meta["desktop_active"] = new_name
+            self._save_meta(meta)
+            return self._profile_from_entry(new_name, entry, meta.get("desktop_active"))
+        finally:
+            self._clear_decryption_cache()
+
+    def remove_profile(self, name: str) -> Optional[Path]:
+        """Remove a saved profile from the catalog, retaining its root for recovery."""
+        try:
+            meta = self._load_meta()
+            entry = meta["profiles"].get(name)
+            if not isinstance(entry, dict):
+                raise SnapshotValidationError(f"Profile '{name}' does not exist")
+            if meta.get("desktop_active") == name:
+                raise SnapshotValidationError(
+                    "Stop Claude and select another profile before removing the active profile"
+                )
+            root = self._root_for_entry(name, entry).resolve()
+            managed_root = self.desktop_data_dir.resolve()
+            if root.parent != managed_root or root.is_symlink():
+                raise SnapshotValidationError("Only isolated profile roots can be removed safely")
+            if self._root_is_running(root):
+                raise SnapshotValidationError(
+                    "Claude is running from this profile; stop it before removing the profile"
+                )
+            retained: Optional[Path] = None
+            if root.exists():
+                self.backups_dir.mkdir(parents=True, exist_ok=True)
+                retained = self.backups_dir / f"removed-{name}-{time.time_ns()}"
+                shutil.move(str(root), str(retained))
+            meta["profiles"].pop(name)
+            remaining = sorted(meta["profiles"])
+            meta["desktop_active"] = remaining[0] if remaining else None
+            try:
+                self._save_meta(meta)
+            except Exception:
+                if retained is not None and retained.exists() and not root.exists():
+                    shutil.move(str(retained), str(root))
+                raise
+            return retained
         finally:
             self._clear_decryption_cache()
 
@@ -946,18 +1078,17 @@ class DesktopBackend:
             meta = self._load_meta()
             _target_entry, target_root = self._validated_profile(target_name)
             self._process_state()
-            history = self.sync_histories()
             executable = self._resolve_executable()
             try:
                 verification = self._launch_root(target_root, executable, set(meta["launch_proofs"]))
             except (ProcessDetectionError, UnknownLiveAccountError):
                 raise
             except Exception as error:
-                return SwitchResult(False, target_name, history=history, message=str(error) or type(error).__name__)
+                return SwitchResult(False, target_name, message=str(error) or type(error).__name__)
             self._apply_launch_verification(meta, target_name, verification)
             meta["desktop_active"] = target_name
             self._save_meta(meta)
-            return SwitchResult(True, target_name, history=history, message="Profile selected", should_relaunch=False)
+            return SwitchResult(True, target_name, message="Profile selected", should_relaunch=False)
         finally:
             self._clear_decryption_cache()
 
@@ -1015,21 +1146,6 @@ class DesktopBackend:
             if not isinstance(account, str):
                 continue
             add(root, account)
-        if self.claude_dir.is_dir() and not self.claude_dir.is_symlink():
-            config = _load_json(self.claude_dir / "config.json")
-            account = config.get("lastKnownAccountUuid")
-            if isinstance(account, str) and account.strip():
-                add(self.claude_dir, account)
-            for session_root in CC_SESSION_ROOTS:
-                history_root = self.claude_dir / session_root
-                if not history_root.is_dir() or history_root.is_symlink():
-                    continue
-                for workspace_path in history_root.iterdir():
-                    if not workspace_path.is_dir() or workspace_path.is_symlink():
-                        continue
-                    for account_path in workspace_path.iterdir():
-                        if account_path.is_dir() and not account_path.is_symlink():
-                            add(self.claude_dir, account_path.name)
         return managed
 
     def _history_workspaces(self, root: Path, account: str) -> dict[str, set[str]]:
@@ -1130,8 +1246,15 @@ class DesktopBackend:
         targets = self._managed_history_targets()
         manifest = _load_json(self.history_manifest)
         report = {"added": 0, "removed": 0}
-        deleted: set[str] = set()
-        for folders in targets.values():
+        grouped: dict[tuple[str, str], list[tuple[Path, str]]] = {}
+        for root_name, folders in targets.items():
+            for folder, key in folders:
+                account_key = key.rsplit("/", 1)[-1]
+                grouped.setdefault((root_name, account_key), []).append((folder, key))
+
+        deleted_by_group: dict[tuple[str, str], set[str]] = {}
+        for group, folders in grouped.items():
+            deleted: set[str] = set()
             for folder, key in folders:
                 if not folder.is_dir():
                     continue
@@ -1141,9 +1264,13 @@ class DesktopBackend:
                     deleted.update(
                         name for name in previous if isinstance(name, str) and name not in current
                     )
-        if deleted:
+            if deleted:
+                deleted_by_group[group] = deleted
+
+        if deleted_by_group:
             self._backup_managed_histories(targets)
-            for folders in targets.values():
+            for group, folders in grouped.items():
+                deleted = deleted_by_group.get(group, set())
                 for folder, _key in folders:
                     if self._history_folder_is_live(folder):
                         continue
@@ -1155,7 +1282,8 @@ class DesktopBackend:
                             report["removed"] += 1
 
         new_manifest: dict[str, list[str]] = {}
-        for root_name, folders in targets.items():
+        for group, folders in grouped.items():
+            deleted = deleted_by_group.get(group, set())
             union: dict[str, Path] = {}
             for folder, _key in folders:
                 for name, path in self._history_json_files(folder).items():
@@ -1840,6 +1968,16 @@ def begin_new_login() -> PendingLogin:
 
 def finalize_current(name: str, label: str, note: str) -> DesktopProfile:
     return _default().finalize_current(name, label, note)
+
+
+def seed_profile(
+    name: str,
+    label: str,
+    note: str,
+    source: Optional[Path] = None,
+    expected_account_uuid: str = "",
+) -> DesktopProfile:
+    return _default().seed_profile(name, label, note, source, expected_account_uuid)
 
 
 def verify_profile(name: str) -> DesktopProfile:

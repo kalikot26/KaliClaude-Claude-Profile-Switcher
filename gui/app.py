@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 try:
     from .desktop_backend import (
@@ -921,8 +921,12 @@ class App:
             state=tk.NORMAL if actions_enabled else tk.DISABLED,
             bg=BG_CARD,
             fg=TXT_PRI if actions_enabled else TXT_MUTE)
-        self._btn_rename.configure(state=tk.DISABLED, fg=TXT_MUTE)
-        self._btn_remove.configure(state=tk.DISABLED, fg=TXT_MUTE)
+        self._btn_rename.configure(
+            state=tk.NORMAL if actions_enabled else tk.DISABLED,
+            fg=TXT_PRI if actions_enabled else TXT_MUTE)
+        self._btn_remove.configure(
+            state=tk.NORMAL if actions_enabled else tk.DISABLED,
+            fg=CLR_ERR if actions_enabled else TXT_MUTE)
         self._refresh_claude_ui()
 
     def _render_usage(self, p: Profile):
@@ -1174,8 +1178,8 @@ class App:
             return
         msg = f"Switch Claude to profile  '{p.name}'?"
         msg += (
-            "\n\nThe original Claude window stays running. "
-            "This opens or focuses a second window for the selected profile."
+            "\n\nThis opens or focuses a second Claude window using only the selected "
+            "isolated profile root. The default Desktop root is not used."
         )
         if not messagebox.askyesno("Switch Profile", msg, parent=self.root):
             return
@@ -1253,18 +1257,16 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_sync_histories(self):
-        """Merge Claude Code + agent-mode history across every account so all
-        profiles share one project list / session history. Leaves Claude running
-        and never rewrites conversation JSONL files."""
+        """Sync local history only between roots carrying the same account ID."""
         if not self._action_ready():
             return
         if not messagebox.askyesno(
             "Sync Claude Code History",
-            "Merge every account's Claude Code + agent-mode sessions so the "
-            "combined project list and history are visible under any profile.\n\n"
-            "• Newest copy wins; user-deleted conversations stay deleted.\n"
+            "Sync Claude Code + agent-mode sessions only between isolated roots "
+            "with the same account ID. Different accounts never share cards.\n\n"
+            "• Newest copy wins within one account; user-deleted conversations stay deleted.\n"
             "• A local history backup is made before deletions propagate.\n"
-            "• The original Claude window stays running.\n"
+            "• The default Desktop root is never included.\n"
             "• Conversation JSONL files are not rewritten.\n\n"
             "Continue?", parent=self.root):
             return
@@ -1356,7 +1358,6 @@ class App:
             for i, p in enumerate(self._profiles):
                 if p.name == data:
                     self._select(i); break
-            # Finalization closes Claude so the pending root can be renamed.
             if messagebox.askyesno(
                 "Launch Claude", f"Saved '{data}'.\n\nReopen Claude now?",
                 parent=self.root):
@@ -1374,6 +1375,38 @@ class App:
             self._busy = False
             messagebox.showerror("Verify Failed", data, parent=self.root)
             self._set_status(f"Verify failed: {data}")
+            self._refresh()
+        elif kind == "rename_ok":
+            self._busy = False
+            old_name, new_name = data
+            self._set_status(f"Renamed '{old_name}' to '{new_name}'.")
+            self._sel = -1
+            self._refresh()
+            for i, p in enumerate(self._profiles):
+                if p.name == new_name:
+                    self._select(i)
+                    break
+        elif kind == "rename_err":
+            self._busy = False
+            messagebox.showerror("Rename Failed", data, parent=self.root)
+            self._set_status(f"Rename failed: {data}")
+            self._refresh()
+        elif kind == "remove_ok":
+            self._busy = False
+            name, retained = data
+            self._set_status(f"Removed '{name}'. Recovery copy retained.")
+            self._sel = -1
+            self._refresh()
+            if retained:
+                messagebox.showinfo(
+                    "Profile Removed",
+                    f"'{name}' was removed from KaliClaude.\n\n"
+                    f"Recovery copy retained at:\n{retained}",
+                    parent=self.root)
+        elif kind == "remove_err":
+            self._busy = False
+            messagebox.showerror("Remove Failed", data, parent=self.root)
+            self._set_status(f"Remove failed: {data}")
             self._refresh()
         elif kind == "prep_ok":
             self._busy = False
@@ -1399,11 +1432,11 @@ class App:
                 f"Claude Code history synced — {added} added, {removed} removed.")
             messagebox.showinfo(
                 "History Synced",
-                "Claude Code + agent-mode history is now merged across all "
-                "profiles.\n\n"
+                "Claude Code + agent-mode history is synced only within the "
+                "same account ID. Different profiles/accounts stay separate.\n\n"
                 f"• {added} session copies added\n"
                 f"• {removed} deleted conversations propagated\n\n"
-                "Whichever account you switch to shows the same up-to-date list.",
+                "No default-root or cross-account cards were copied.",
                 parent=self.root)
             self._refresh()
         elif kind == "sync_err":
@@ -1472,20 +1505,46 @@ class App:
     def _on_rename(self):
         if not self._action_ready(require_selection=True):
             return
-        messagebox.showinfo(
-            "Rename Unavailable",
-            "Isolated profile roots cannot be renamed from this release.",
-            parent=self.root,
-        )
+        old_name = self._profiles[self._sel].name
+        new_name = simpledialog.askstring(
+            "Rename Profile", "New profile name:", initialvalue=old_name, parent=self.root)
+        if new_name is None or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        self._busy = True
+        self._set_status(f"Renaming '{old_name}'…")
+
+        def work():
+            try:
+                _desktop_backend().rename_profile(old_name, new_name)
+                self._q.put(("rename_ok", (old_name, new_name)))
+            except Exception as error:
+                self._q.put(("rename_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_remove(self):
         if not self._action_ready(require_selection=True):
             return
-        messagebox.showinfo(
-            "Remove Unavailable",
-            "Isolated profile roots are preserved for recovery and cannot be removed from this release.",
-            parent=self.root,
-        )
+        name = self._profiles[self._sel].name
+        if not messagebox.askyesno(
+            "Remove Profile",
+            f"Remove '{name}' from KaliClaude?\n\n"
+            "Its isolated root will be moved to a recovery folder, not deleted. "
+            "The active/running profile must be stopped first.",
+            parent=self.root):
+            return
+        self._busy = True
+        self._set_status(f"Removing '{name}'…")
+
+        def work():
+            try:
+                retained = _desktop_backend().remove_profile(name)
+                self._q.put(("remove_ok", (name, str(retained) if retained else "")))
+            except Exception as error:
+                self._q.put(("remove_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _note_changed(self, _=None):
         return

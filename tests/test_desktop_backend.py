@@ -197,12 +197,15 @@ class IsolatedDesktopTests(unittest.TestCase):
         for method in (
             "begin_new_login",
             "finalize_current",
+            "rename_profile",
+            "remove_profile",
             "verify_profile",
             "switch",
             "launch_active",
             "active_user_data_dir",
             "discard_pending_login",
             "update_profile_usage",
+            "seed_profile",
         ):
             self.assertTrue(hasattr(self.backend, method), method)
 
@@ -229,6 +232,37 @@ class IsolatedDesktopTests(unittest.TestCase):
             self.assertNotEqual((alpha / relative).read_bytes(), (beta / relative).read_bytes())
         self.assertEqual("beta", self.meta()["desktop_active"])
         self.assertNotIn("active", self.meta())
+
+    def test_rename_profile_keeps_root_and_updates_active_metadata(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        root = self.profile_root("alpha")
+
+        renamed = self.backend.rename_profile("alpha", "primary")
+
+        self.assertEqual("primary", renamed.name)
+        self.assertEqual(root, self.profile_root("primary"))
+        self.assertNotIn("alpha", self.meta()["profiles"])
+        self.assertEqual("primary", self.meta()["desktop_active"])
+
+    def test_remove_profile_retains_root_and_updates_catalog(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        root = self.profile_root("alpha")
+        before = file_digest(root)
+
+        retained = self.backend.remove_profile("alpha")
+
+        self.assertIsNotNone(retained)
+        self.assertFalse(root.exists())
+        self.assertEqual(before, file_digest(retained))
+        self.assertNotIn("alpha", self.meta()["profiles"])
+        self.assertEqual("beta", self.meta()["desktop_active"])
+
+    def test_remove_active_profile_requires_a_safe_stop_first(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+
+        with self.assertRaisesRegex(DesktopBackendError, "active profile"):
+            self.backend.remove_profile("alpha")
 
     def test_switch_copies_no_profile_storage_and_direct_launches_target(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
@@ -491,7 +525,7 @@ class IsolatedDesktopTests(unittest.TestCase):
         path.write_text(value, encoding="utf-8")
         return path
 
-    def test_history_sync_closes_desktop_and_merges_only_managed_roots(self) -> None:
+    def test_history_sync_keeps_different_account_roots_separate(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
         alpha = self.profile_root("alpha")
@@ -500,6 +534,7 @@ class IsolatedDesktopTests(unittest.TestCase):
         self._write_history_log(beta, "workspace", "uuid-b")
         self._write_history(alpha, "workspace", "uuid-a", "alpha.json", "alpha")
         self._write_history(beta, "workspace", "uuid-b", "beta.json", "beta")
+        self._write_history(self.default_root, "workspace", "uuid-a", "default.json", "default")
         self.platform.pids = [101]
         jsonl = self.default_root / "projects" / "alpha.jsonl"
         jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -511,9 +546,14 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertEqual([101], self.platform.pids)
         self.assertEqual([], self.platform.closed)
         self.assertEqual("do-not-touch", jsonl.read_text(encoding="utf-8"))
-        for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
-            folder = root / "claude-code-sessions" / "workspace" / account
-            self.assertEqual({"alpha.json", "beta.json"}, {path.name for path in folder.glob("*.json")})
+        self.assertEqual(
+            {"alpha.json"},
+            {path.name for path in (alpha / "claude-code-sessions" / "workspace" / "uuid-a").glob("*.json")},
+        )
+        self.assertEqual(
+            {"beta.json"},
+            {path.name for path in (beta / "claude-code-sessions" / "workspace" / "uuid-b").glob("*.json")},
+        )
 
     def test_history_sync_rejects_encoded_traversal_segments(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
@@ -530,10 +570,10 @@ class IsolatedDesktopTests(unittest.TestCase):
 
     def test_history_deletion_is_scoped_to_explicit_managed_account_directories(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
-        self.create_profile("beta", "uuid-b", "org-b")
+        self.create_profile("beta", "uuid-a", "org-a")
         alpha = self.profile_root("alpha")
         beta = self.profile_root("beta")
-        for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
+        for root, account in ((alpha, "uuid-a"), (beta, "uuid-a")):
             self._write_history_log(root, "workspace", account)
         source = self._write_history(alpha, "workspace", "uuid-a", "removed.json", "managed")
         self.assertTrue(self.backend.sync_histories().ok)
@@ -549,7 +589,7 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertTrue(unrelated.is_file())
         self.assertEqual("unmanaged", unrelated.read_text(encoding="utf-8"))
 
-    def test_history_failure_is_nonfatal_to_stopped_profile_switch(self) -> None:
+    def test_switch_does_not_run_history_sync(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
         self.backend._history_sync = lambda: (_ for _ in ()).throw(OSError("fixture history failure"))
@@ -557,9 +597,33 @@ class IsolatedDesktopTests(unittest.TestCase):
         result = self.backend.switch("alpha")
 
         self.assertTrue(result.ok)
-        self.assertIsNotNone(result.history)
-        self.assertFalse(result.history.ok)
+        self.assertIsNone(result.history)
         self.assertEqual("alpha", self.meta()["desktop_active"])
+
+
+    def test_seed_profile_is_disabled_for_saved_logins(self) -> None:
+        self.seed_root(self.default_root, account_uuid="uuid-john", organization="org-john")
+        with self.assertRaises(desktop_backend.SnapshotValidationError):
+            self.backend.seed_profile("john", "John", "", expected_account_uuid="uuid-john")
+        self.assertEqual({"config.json", "Network/Cookies", "Trusted Devices/device.json", "Partitions/partition.txt", "Local State"}, set(file_digest(self.default_root)))
+        meta = self.meta() if self.backend.meta_file.exists() else {"profiles": {}}
+        self.assertNotIn("john", meta.get("profiles", {}))
+
+    def test_relaunch_uses_persisted_active_isolated_profile(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        self.platform.pids = [101]
+        self.assertTrue(self.backend.switch("alpha").ok)
+
+        relaunched_backend = DesktopBackend(
+            claude_dir=self.default_root,
+            cache_dir=self.cache,
+            process_adapter=self.platform,
+            launch_timeout=0.02,
+            launch_poll_interval=0,
+        )
+
+        self.assertEqual(self.profile_root("alpha"), relaunched_backend.active_user_data_dir())
 
     def test_prepare_and_switch_leave_original_window_running(self) -> None:
         self.seed_root(self.default_root, account_uuid="uuid-default", organization="org-default")
@@ -602,7 +666,7 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertEqual([202], self.platform.pids)
         self.assertEqual([], self.platform.closed)
 
-    def test_codex_packaged_executable_is_rejected(self) -> None:
+    def test_codex_packaged_executable_is_ignored(self) -> None:
         adapter = desktop_backend.WindowsDesktopProcessAdapter(platform_name="nt")
         squirrel = Path(r"C:\Users\fixture\AppData\Local\AnthropicClaude\app-1.0.0\Claude.exe")
         codex = Path(r"C:\Users\fixture\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\AnthropicClaude\app-1.0.0\Claude.exe")
@@ -615,8 +679,103 @@ class IsolatedDesktopTests(unittest.TestCase):
         with patch.object(adapter, "_run", return_value=rows), patch.object(
             adapter, "_verified_squirrel", return_value=[desktop_backend.ExecutableSpec(squirrel, "1.0.0", "squirrel")]
         ), patch.object(adapter, "_verified_msix", return_value=[]):
-            with self.assertRaises(OSError):
-                adapter.desktop_pids()
+            self.assertEqual([10], adapter.desktop_pids())
+
+    def test_store_sharing_violation_falls_back_to_squirrel(self) -> None:
+        squirrel = Path(r"C:\Users\fixture\AppData\Local\AnthropicClaude\app-1.0.0\Claude.exe")
+        store = Path(r"C:\Program Files\WindowsApps\Claude_1.40609.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe")
+        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        launches: list[list[str]] = []
+        launch_cwds: list[str] = []
+
+        def launcher(command, env=None, cwd=None, creationflags=0):
+            launches.append(list(command))
+            launch_cwds.append(str(cwd))
+            if "WindowsApps" in command[0]:
+                raise OSError(None, "sharing violation", command[0], -1073283040)
+            return SimpleNamespace(pid=404)
+
+        adapter._launcher = launcher
+        with patch.object(
+            adapter, "_verified_msix", return_value=[desktop_backend.ExecutableSpec(store, "1.40609.0.0", "msix")]
+        ), patch.object(
+            adapter, "_verified_squirrel", side_effect=[[], [
+                desktop_backend.ExecutableSpec(squirrel, "1.37937.3", "squirrel")
+            ]]
+        ), patch.object(adapter, "_verified_desktop_processes", return_value=[]):
+            adapter.launch(
+                desktop_backend.ExecutableSpec(store, "1.40609.0.0", "msix"),
+                {"CLAUDE_USER_DATA_DIR": r"C:\temp\john"},
+            )
+
+        self.assertEqual(2, len(launches))
+        self.assertIn("WindowsApps", launches[0][0])
+        self.assertEqual(str(squirrel), launches[1][0])
+        self.assertEqual(str(squirrel.parent), launch_cwds[1])
+        self.assertEqual(["--user-data-dir=C:\\temp\\john"], launches[1][1:])
+
+    def test_store_spec_is_replaced_by_squirrel_before_launch(self) -> None:
+        squirrel = Path(r"C:\Users\fixture\AppData\Local\AnthropicClaude\app-1.0.0\Claude.exe")
+        store = Path(r"C:\Program Files\WindowsApps\Claude_1.40609.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe")
+        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        launcher = Mock()
+        launcher.return_value.pid = 41
+        adapter._launcher = launcher
+        with patch.object(adapter, "_verified_squirrel", return_value=[
+            desktop_backend.ExecutableSpec(squirrel, "1.37937.3", "squirrel")
+        ]), patch.object(adapter, "_verified_desktop_processes", return_value=[]):
+            adapter.launch(
+                desktop_backend.ExecutableSpec(store, "1.40609.0.0", "msix"),
+                {"CLAUDE_USER_DATA_DIR": r"C:\temp\john"},
+            )
+
+        self.assertEqual(str(squirrel), launcher.call_args.args[0][0])
+        self.assertEqual(str(squirrel.parent), launcher.call_args.kwargs["cwd"])
+
+    def test_squirrel_resolution_uses_existing_case_insensitive_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            install = Path(directory) / "AnthropicClaude"
+            executable = install / "APP-1.37937.3" / "cLaUdE.ExE"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"fixture")
+            adapter = desktop_backend.WindowsDesktopProcessAdapter()
+            with patch.dict("os.environ", {"LOCALAPPDATA": directory, "USERPROFILE": directory}, clear=False), patch.object(
+                adapter, "_valid_product", side_effect=AssertionError("PowerShell product query must not run")
+            ):
+                resolved = adapter._verified_squirrel()
+
+        self.assertEqual(executable, resolved[0].path)
+        self.assertEqual("1.37937.3", resolved[0].version)
+
+    def test_squirrel_resolution_falls_back_when_localappdata_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            user_root = Path(directory)
+            executable = user_root / "AppData" / "Local" / "AnthropicClaude" / "app-1.37937.3" / "Claude.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"fixture")
+            adapter = desktop_backend.WindowsDesktopProcessAdapter()
+            with patch.dict(
+                "os.environ",
+                {"LOCALAPPDATA": "", "USERPROFILE": str(user_root)},
+                clear=False,
+            ):
+                resolved = adapter._verified_squirrel()
+
+        self.assertEqual(executable, resolved[0].path)
+
+    def test_squirrel_resolution_is_preferred_over_store(self) -> None:
+        squirrel = Path(r"C:\Users\fixture\AppData\Local\AnthropicClaude\app-1.0.0\Claude.exe")
+        store = Path(r"C:\Program Files\WindowsApps\Claude_1.40609.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe")
+        adapter = desktop_backend.WindowsDesktopProcessAdapter()
+        with patch.object(
+            adapter, "_verified_msix", return_value=[desktop_backend.ExecutableSpec(store, "1.40609.0.0", "msix")]
+        ), patch.object(
+            adapter, "_verified_squirrel", return_value=[desktop_backend.ExecutableSpec(squirrel, "1.37937.3", "squirrel")]
+        ):
+            executable = adapter.resolve_executable()
+
+        self.assertEqual("squirrel", executable.kind)
+        self.assertEqual("1.37937.3", executable.version)
 
 
 class LegacyMigrationTests(unittest.TestCase):
@@ -1155,9 +1314,9 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
                 executable.parent.mkdir(parents=True)
                 executable.write_bytes(b"fixture")
             adapter = desktop_backend.WindowsDesktopProcessAdapter()
-            with patch.dict("os.environ", {"LOCALAPPDATA": directory}, clear=False), patch.object(
+            with patch.dict("os.environ", {"LOCALAPPDATA": directory, "USERPROFILE": directory}, clear=False), patch.object(
                 adapter, "_valid_product", return_value=True
-            ):
+            ), patch.object(adapter, "_verified_msix", return_value=[]):
                 executable = adapter.resolve_executable()
 
         self.assertEqual("1.10.0", executable.version)
@@ -1242,7 +1401,7 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
             adapter.launch(executable, environment)
 
         self.assertEqual(
-            [str(executable.path), "--user-data-dir", environment["CLAUDE_USER_DATA_DIR"]],
+            [str(executable.path), "--user-data-dir=" + environment["CLAUDE_USER_DATA_DIR"]],
             popen.call_args.args[0],
         )
         self.assertEqual(environment, popen.call_args.kwargs["env"])

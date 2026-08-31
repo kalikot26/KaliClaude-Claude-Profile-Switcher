@@ -21,8 +21,8 @@ credentials.
 - Managed launch/stop targets only a verified Claude Desktop installation and
   fails closed on unknown or unclassifiable `claude.exe` processes.
 - Manual usage refresh reads only the selected active root's cookie database.
-- History sync merges managed Claude Code and agent-mode account directories
-  across default and isolated roots without closing Claude. Conversation JSONL
+- History sync is limited to isolated roots carrying the same account UUID;
+  different accounts and the default root never share cards. Conversation JSONL
   files are never rewritten. Unsafe path segments are rejected, and deletion
   does not touch a root whose Claude window is still running.
 
@@ -60,7 +60,7 @@ important profile data.
 2. Choose **Prepare New Login**. Claude opens with a fresh isolated root.
 3. Sign in in the new window, then choose **Save Current Login** and name it.
 4. Select another healthy profile and choose **Switch to this Profile**. That
-   opens or focuses its window; the original window is left running.
+   opens or focuses its isolated window; the default root is never used.
 5. Use **Verify Login** when a profile shows **Needs validation**.
 6. A **Needs re-login** profile has preserved recovery material but no exact
    verified login that can be selected safely; prepare and save a fresh login.
@@ -82,6 +82,11 @@ Data lives under `%USERPROFILE%\.kalikot-claude-switcher\`:
 - `profiles\` — retained legacy schema-2 material used only for migration
 - `meta.json` — schema-3 profile selection and validation metadata
 
+`meta.json` is the single source for the last selected profile (`desktop_active`)
+and is written only after a managed isolated launch is verified. A separate
+SQLite database is intentionally not used for this one-row state; it would
+duplicate the catalog and introduce another recovery/concurrency boundary.
+
 ## Privacy and safety boundary
 
 KaliClaude stores profile data locally and does not log credentials. Its usage
@@ -101,6 +106,23 @@ The suite covers isolated roots and direct launch verification, fail-closed proc
 handling, lossless migration (including real SQLite WAL/SHM fixtures), AST-enforced
 offline cookie recovery, active-root-only usage, Tk worker marshalling, and safe
 cross-root history sync.
+
+Packaged-launcher note: Squirrel discovery checks `%LOCALAPPDATA%`, the derived
+`%USERPROFILE%\AppData\Local` path, and `Path.home()`; it is case-insensitive and
+requires only an existing `app-*\claude.exe`. Squirrel is preferred before the
+Store executable, so a locked Store install cannot mask the usable Squirrel
+install. The launch boundary re-probes Squirrel before accepting any Store
+specification, blocking stale Store-first callers as well. Rebuild only after
+closing KaliClaude itself; the running GUI locks `dist\KaliClaude.exe` on
+Windows.
+
+Store-launch compatibility proof (2026-09-01): the fresh Microsoft Store build
+accepted `--user-data-dir=<isolated-root>` but split `--user-data-dir <root>`
+left its child processes on `%APPDATA%\Claude`. Launch now uses the equals form.
+The live source launch created the pending isolated root, produced its own
+`logs\main.log`, and all nine verified Claude processes reported that isolated
+root; the login page opened without credentials. The packaged GUI was rebuilt
+after this fix.
 
 Claude Code account switching is outside Phase 1.1. Managed Claude Code and
 agent-mode history synchronization remains part of this release.
