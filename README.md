@@ -3,24 +3,28 @@
 KaliClaude is a Windows desktop tool for selecting between multiple Claude
 Desktop logins. Each saved profile owns a complete Electron user-data root;
 switching selects that root and launches the verified Claude Desktop executable
-directly with `CLAUDE_USER_DATA_DIR`. Steady-state switching does not copy,
-restore, or replay profile credentials.
+directly with `--user-data-dir` / `CLAUDE_USER_DATA_DIR`. The original
+`%APPDATA%\Claude` window is never stopped; saved profiles open as extra
+windows. Steady-state switching does not copy, restore, or replay profile
+credentials.
 
 ## Features
 
 - Profile states: **Active**, **Ready**, **Needs validation**, **Needs re-login**,
   and **Corrupt**.
 - **Prepare New Login** creates a unique pending isolated root and opens Claude
-  Desktop against that exact root. Existing profiles are not cleared or rewritten.
-- **Save Current Login** finalizes the pending root after sign-in.
+  Desktop against that exact root as a second window. The original Claude
+  window stays running. Existing profiles are not cleared or rewritten.
+- **Save Current Login** names the pending isolated root after sign-in without
+  closing Claude.
 - **Verify Login** checks the persistent profile identity without making a snapshot.
 - Managed launch/stop targets only a verified Claude Desktop installation and
   fails closed on unknown or unclassifiable `claude.exe` processes.
 - Manual usage refresh reads only the selected active root's cookie database.
 - History sync merges managed Claude Code and agent-mode account directories
-  across default and isolated roots while Claude Desktop is closed. Unsafe path
-  segments are rejected, and deletion propagation stays inside managed account
-  directories.
+  across default and isolated roots without closing Claude. Conversation JSONL
+  files are never rewritten. Unsafe path segments are rejected, and deletion
+  does not touch a root whose Claude window is still running.
 
 ## Requirements and setup
 
@@ -54,8 +58,9 @@ important profile data.
 1. Start KaliClaude and allow its offline profile audit to finish. If the audit
    fails, profile/process actions stay disabled.
 2. Choose **Prepare New Login**. Claude opens with a fresh isolated root.
-3. Sign in to Claude Desktop, then choose **Save Current Login** and name it.
-4. Select another healthy profile and choose **Switch to this Profile**.
+3. Sign in in the new window, then choose **Save Current Login** and name it.
+4. Select another healthy profile and choose **Switch to this Profile**. That
+   opens or focuses its window; the original window is left running.
 5. Use **Verify Login** when a profile shows **Needs validation**.
 6. A **Needs re-login** profile has preserved recovery material but no exact
    verified login that can be selected safely; prepare and save a fresh login.

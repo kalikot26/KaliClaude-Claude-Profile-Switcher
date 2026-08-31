@@ -91,6 +91,7 @@ class GuiContractTests(unittest.TestCase):
         self.assertEqual(("prep_ok", (pending, launch)), app._q.get_nowait())
         backend.begin_new_login.assert_called_once_with()
         backend.launch_active.assert_called_once_with()
+        backend.stop_desktop.assert_not_called()
         self.assertFalse(hasattr(backend, "prepare_new_login") and backend.prepare_new_login.called)
 
     def test_prepare_failure_discards_pending_login(self) -> None:

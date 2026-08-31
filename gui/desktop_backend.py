@@ -2,7 +2,9 @@
 
 Each saved Desktop profile owns a complete Electron user-data root.  Switching
 only selects a root and launches a verified Claude Desktop executable with
-``CLAUDE_USER_DATA_DIR``; it never copies credentials or Chromium storage.
+``--user-data-dir`` / ``CLAUDE_USER_DATA_DIR``. The original
+`%APPDATA%\\Claude` window is never stopped. Profile windows are extra
+processes. Credentials and Chromium storage are never copied between roots.
 """
 from __future__ import annotations
 
@@ -31,6 +33,11 @@ OAUTH_KEY_V2 = "oauth:tokenCacheV2"
 MAX_OPERATIONAL_BACKUPS = 5
 MAX_HISTORY_BACKUPS = 5
 CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
+JSONL_NAME = ".jsonl"
+_USER_DATA_DIR_RE = re.compile(
+    r"--user-data-dir(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|(\S+))",
+    re.IGNORECASE,
+)
 LEGACY_SESSION_ITEMS = (
     "Session Storage",
     "IndexedDB",
@@ -138,6 +145,9 @@ class _VerifiedDesktopProcess:
     pid: int
     parent_pid: int
     started: str
+    executable: str = ""
+    command_line: str = ""
+    user_data_dir: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +222,31 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 def _windows_path_key(path: Path | str) -> str:
     return str(path).replace("/", "\\").lower()
+
+
+def _is_codex_virtualized_path(path: Path | str) -> bool:
+    key = _windows_path_key(path)
+    return "\\packages\\openai.codex_" in key and "\\anthropicclaude\\" in key
+
+
+def _parse_user_data_dir(command_line: str) -> Optional[Path]:
+    match = _USER_DATA_DIR_RE.search(command_line or "")
+    if match is None:
+        return None
+    raw = next((group for group in match.groups() if group), None)
+    if not raw:
+        return None
+    try:
+        return Path(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _same_user_data_root(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return _windows_path_key(left) == _windows_path_key(right)
 
 
 class WindowsDesktopProcessAdapter:
@@ -294,7 +329,7 @@ class WindowsDesktopProcessAdapter:
         rows = json.loads(
             self._run(
                 "@(Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
-                "Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath) | ConvertTo-Json -Compress"
+                "Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine) | ConvertTo-Json -Compress"
             )
             or "[]"
         )
@@ -319,13 +354,19 @@ class WindowsDesktopProcessAdapter:
             normalized = executable.replace("/", "\\").lower()
             if "\\claude-code\\" in normalized or "\\@anthropic-ai\\claude-code\\" in normalized or normalized.endswith("\\.local\\bin\\claude.exe"):
                 continue
+            if _is_codex_virtualized_path(path):
+                raise OSError("Codex-packaged Claude is not a verified Desktop executable")
             if normalized not in verified_paths:
                 raise OSError("A Claude executable is not an installed verified Desktop executable")
+            command_line = str(row.get("CommandLine") or "") if isinstance(row, dict) else ""
             processes.append(
                 _VerifiedDesktopProcess(
                     pid=int(row["ProcessId"]),
                     parent_pid=int(row.get("ParentProcessId") or 0),
                     started=str(row.get("CreationDate") or ""),
+                    executable=executable,
+                    command_line=command_line,
+                    user_data_dir=_parse_user_data_dir(command_line),
                 )
             )
         return processes
@@ -335,6 +376,9 @@ class WindowsDesktopProcessAdapter:
 
     def desktop_pids(self) -> list[int]:
         return self._verified_desktop_pids()
+
+    def desktop_processes(self) -> list[_VerifiedDesktopProcess]:
+        return self._verified_desktop_processes()
 
     def unknown_desktop_pids(self) -> list[int]:
         processes = self._verified_desktop_processes()
@@ -374,8 +418,12 @@ class WindowsDesktopProcessAdapter:
             subprocess.run(["taskkill.exe", "/F", "/PID", str(int(pid))], capture_output=True, timeout=8, creationflags=self._NO_WINDOW)
 
     def launch(self, executable: ExecutableSpec, env: dict[str, str]) -> None:
+        command = [str(executable.path)]
+        user_data_dir = env.get("CLAUDE_USER_DATA_DIR")
+        if user_data_dir:
+            command.extend(["--user-data-dir", user_data_dir])
         process = self._launcher(
-            [str(executable.path)], env=env, creationflags=self._NO_WINDOW
+            command, env=env, creationflags=self._NO_WINDOW
         )
         if isinstance(process.pid, int):
             self._managed_pids[process.pid] = ""
@@ -450,6 +498,9 @@ class DesktopBackend:
         return bool(name) and len(name) <= 64 and all(character.isalnum() or character in "-_" for character in name)
 
     def _root_for_entry(self, name: str, entry: dict[str, Any]) -> Path:
+        raw_path = entry.get("root_path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            return Path(raw_path)
         try:
             mode = StorageMode(entry.get("storage_mode", StorageMode.ISOLATED.value))
         except ValueError as error:
@@ -558,7 +609,7 @@ class DesktopBackend:
             if root.parent != self.desktop_data_dir.resolve() or not name.startswith("pending-"):
                 raise SnapshotValidationError("The pending login path is not managed safely")
             try:
-                self._stop_desktop()
+                self._stop_root(root)
             except Exception:
                 meta.pop("pending_login", None)
                 self._save_meta(meta)
@@ -611,10 +662,8 @@ class DesktopBackend:
             destination = self.desktop_data_dir / name
             if not pending_root.is_dir() or destination.exists() or name in meta["profiles"]:
                 raise SnapshotValidationError("The pending login cannot be finalized safely")
-            self._stop_desktop()
             account_hash = self._read_account_hash(pending_root)
             config = _load_json(pending_root / "config.json")
-            os.replace(pending_root, destination)
             meta["profiles"][name] = {
                 "label": label.strip() or name,
                 "note": note.strip(),
@@ -624,6 +673,7 @@ class DesktopBackend:
                 "state_reason": "Awaiting verified managed launch",
                 "account_id_sha256": account_hash,
                 "oauth_organization_sha256": self._oauth_organization_hashes(config),
+                "root_path": str(pending_root),
             }
             meta.pop("pending_login", None)
             meta["desktop_active"] = name
@@ -672,6 +722,8 @@ class DesktopBackend:
             if not callable(classifier):
                 raise ProcessDetectionError("The process adapter cannot classify external Claude Desktop launches")
             unknown = classifier()
+            allowed = self._allowed_live_pids()
+            unknown = [pid for pid in unknown if pid not in allowed]
             if unknown:
                 raise UnknownLiveAccountError("An unknown external Claude Desktop launch is running")
             return list(self._process.desktop_pids())
@@ -680,19 +732,83 @@ class DesktopBackend:
         except Exception as error:
             raise ProcessDetectionError("Could not verify whether Claude Desktop is running") from error
 
+    def _known_user_data_roots(self) -> list[Path]:
+        roots = [self.claude_dir]
+        meta = _load_json(self.meta_file)
+        pending = meta.get("pending_login")
+        if isinstance(pending, dict) and isinstance(pending.get("name"), str):
+            roots.append(self.desktop_data_dir / pending["name"])
+        for name, entry in (meta.get("profiles") or {}).items():
+            if isinstance(name, str) and isinstance(entry, dict) and self._valid_name(name):
+                roots.append(self._root_for_entry(name, entry))
+        return roots
+
+    def _allowed_live_pids(self) -> set[int]:
+        allowed: set[int] = set()
+        for root in self._known_user_data_roots():
+            allowed.update(self._pids_for_root(root))
+        return allowed
+
+    def _desktop_processes(self) -> list[_VerifiedDesktopProcess]:
+        listing = getattr(self._process, "desktop_processes", None)
+        if callable(listing):
+            records = listing()
+            if isinstance(records, list):
+                return [record for record in records if isinstance(record, _VerifiedDesktopProcess)]
+        return []
+
+    def _process_user_data_dir(self, process: _VerifiedDesktopProcess) -> Path:
+        if process.user_data_dir is not None:
+            return process.user_data_dir
+        parsed = _parse_user_data_dir(process.command_line)
+        if parsed is not None:
+            return parsed
+        return self.claude_dir
+
+    def _pids_for_root(self, root: Path) -> list[int]:
+        return [
+            process.pid
+            for process in self._desktop_processes()
+            if _same_user_data_root(self._process_user_data_dir(process), root)
+        ]
+
+    def _root_is_running(self, root: Path) -> bool:
+        return bool(self._pids_for_root(root))
+
+    def _history_folder_is_live(self, folder: Path) -> bool:
+        for root, _account in self._managed_history_roots():
+            try:
+                resolved_root = root.resolve()
+                resolved_folder = folder.resolve()
+            except OSError:
+                continue
+            if resolved_folder == resolved_root or resolved_root in resolved_folder.parents:
+                if self._root_is_running(root):
+                    return True
+        return False
+
     def _stop_desktop(self) -> bool:
-        pids = self._process_state()
+        return self._stop_root(self.active_user_data_dir(), allow_original=False)
+
+    def _stop_root(self, root: Path, *, allow_original: bool = False) -> bool:
+        self._process_state()
+        if not allow_original and _same_user_data_root(root, self.claude_dir):
+            raise DesktopBackendError("The original Claude window is not stopped by KaliClaude")
+        pids = self._pids_for_root(root)
         if not pids:
             return False
         try:
             self._process.request_close(pids)
-            if not self._process.wait_stopped(6.0):
-                remaining = self._process_state()
-                if remaining:
-                    self._process.force_stop(remaining)
-                if not self._process.wait_stopped(4.0):
-                    raise DesktopBackendError("Claude Desktop did not stop")
-            if self._process_state():
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline and self._pids_for_root(root):
+                time.sleep(0.25)
+            remaining = self._pids_for_root(root)
+            if remaining:
+                self._process.force_stop(remaining)
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline and self._pids_for_root(root):
+                    time.sleep(0.25)
+            if self._pids_for_root(root):
                 raise DesktopBackendError("Claude Desktop shutdown could not be proven")
         except DesktopBackendError:
             raise
@@ -707,7 +823,10 @@ class DesktopBackend:
             self._clear_decryption_cache()
 
     def desktop_running(self) -> bool:
-        return bool(self.desktop_pids())
+        try:
+            return self._root_is_running(self.active_user_data_dir())
+        except Exception:
+            return bool(self.desktop_pids())
 
     def stop_desktop(self) -> bool:
         try:
@@ -744,17 +863,22 @@ class DesktopBackend:
             return b""
 
     def _launch_root(self, root: Path, executable: ExecutableSpec, proof_keys: set[str]) -> _LaunchVerification:
-        if self._process_state():
-            raise DesktopBackendError("Claude Desktop is already running")
+        self._process_state()
+        proof_key = f"{executable.path}|{executable.version}"
+        cached_proof = proof_key in proof_keys
+        if self._root_is_running(root):
+            return _LaunchVerification(
+                proof_key=proof_key,
+                ready=True,
+                already_isolation_verified=True,
+            )
         before = self._log_bytes(root)
         environment = dict(os.environ)
         environment["CLAUDE_USER_DATA_DIR"] = str(root)
         self._process.launch(executable, environment)
-        proof_key = f"{executable.path}|{executable.version}"
-        cached_proof = proof_key in proof_keys
         deadline = time.monotonic() + self._launch_timeout
         while True:
-            pids = self._process_state()
+            pids = self._pids_for_root(root)
             after = self._log_bytes(root)
             new_log = after[len(before):] if after.startswith(before) else after
             text = new_log.decode("utf-8", errors="ignore").lower()
@@ -821,34 +945,19 @@ class DesktopBackend:
         try:
             meta = self._load_meta()
             _target_entry, target_root = self._validated_profile(target_name)
-            previous_name = meta.get("desktop_active") if isinstance(meta.get("desktop_active"), str) else None
-            was_running = bool(self._process_state())
-            if was_running:
-                self._stop_desktop()
+            self._process_state()
             history = self.sync_histories()
-            if was_running:
-                executable = self._resolve_executable()
-                try:
-                    verification = self._launch_root(target_root, executable, set(meta["launch_proofs"]))
-                except Exception as error:
-                    try:
-                        if self._process_state():
-                            self._stop_desktop()
-                    except Exception:
-                        pass
-                    if previous_name and previous_name in meta["profiles"]:
-                        try:
-                            previous_root = self._root_for_entry(previous_name, meta["profiles"][previous_name])
-                            self._launch_root(previous_root, executable, set(meta["launch_proofs"]))
-                        except Exception:
-                            pass
-                    return SwitchResult(False, target_name, history=history, message=str(error) or type(error).__name__)
-                self._apply_launch_verification(meta, target_name, verification)
-            # Commit selection last: failed stop/detection/launch paths return above
-            # without altering metadata or copying any root content.
+            executable = self._resolve_executable()
+            try:
+                verification = self._launch_root(target_root, executable, set(meta["launch_proofs"]))
+            except (ProcessDetectionError, UnknownLiveAccountError):
+                raise
+            except Exception as error:
+                return SwitchResult(False, target_name, history=history, message=str(error) or type(error).__name__)
+            self._apply_launch_verification(meta, target_name, verification)
             meta["desktop_active"] = target_name
             self._save_meta(meta)
-            return SwitchResult(True, target_name, history=history, message="Profile selected")
+            return SwitchResult(True, target_name, history=history, message="Profile selected", should_relaunch=False)
         finally:
             self._clear_decryption_cache()
 
@@ -880,7 +989,21 @@ class DesktopBackend:
 
     def _managed_history_roots(self) -> list[tuple[Path, str]]:
         meta = self._load_meta()
-        managed: dict[str, tuple[Path, str]] = {}
+        managed: list[tuple[Path, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(root: Path, account: str) -> None:
+            try:
+                resolved = root.resolve()
+                safe_account = self._safe_history_segment(account)
+            except (OSError, SnapshotValidationError):
+                return
+            key = (_windows_path_key(resolved), safe_account)
+            if key in seen:
+                return
+            seen.add(key)
+            managed.append((resolved, safe_account))
+
         for name, entry in meta.get("profiles", {}).items():
             if not isinstance(name, str) or not isinstance(entry, dict) or not self._valid_name(name):
                 continue
@@ -891,10 +1014,23 @@ class DesktopBackend:
             account = config.get("lastKnownAccountUuid")
             if not isinstance(account, str):
                 continue
-            account = self._safe_history_segment(account)
-            resolved = root.resolve()
-            managed[str(resolved).casefold()] = (resolved, account)
-        return list(managed.values())
+            add(root, account)
+        if self.claude_dir.is_dir() and not self.claude_dir.is_symlink():
+            config = _load_json(self.claude_dir / "config.json")
+            account = config.get("lastKnownAccountUuid")
+            if isinstance(account, str) and account.strip():
+                add(self.claude_dir, account)
+            for session_root in CC_SESSION_ROOTS:
+                history_root = self.claude_dir / session_root
+                if not history_root.is_dir() or history_root.is_symlink():
+                    continue
+                for workspace_path in history_root.iterdir():
+                    if not workspace_path.is_dir() or workspace_path.is_symlink():
+                        continue
+                    for account_path in workspace_path.iterdir():
+                        if account_path.is_dir() and not account_path.is_symlink():
+                            add(self.claude_dir, account_path.name)
+        return managed
 
     def _history_workspaces(self, root: Path, account: str) -> dict[str, set[str]]:
         workspaces = {root_name: set() for root_name in CC_SESSION_ROOTS}
@@ -961,6 +1097,8 @@ class DesktopBackend:
         for path in folder.iterdir():
             if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".json":
                 continue
+            if path.suffix.lower() == JSONL_NAME or path.name.lower().endswith(".jsonl"):
+                continue
             name = self._safe_history_segment(path.name)
             files[name] = path
         return files
@@ -1007,6 +1145,8 @@ class DesktopBackend:
             self._backup_managed_histories(targets)
             for folders in targets.values():
                 for folder, _key in folders:
+                    if self._history_folder_is_live(folder):
+                        continue
                     for name in deleted:
                         safe_name = self._safe_history_segment(name)
                         path = self._contained_path(folder, safe_name)
@@ -1037,7 +1177,6 @@ class DesktopBackend:
 
     def sync_histories(self) -> SyncReport:
         try:
-            self._stop_desktop()
             value = self._history_sync() if self._history_sync is not None else self._sync_histories_local()
             if isinstance(value, SyncReport):
                 return value

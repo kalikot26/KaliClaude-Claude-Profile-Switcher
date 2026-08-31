@@ -44,6 +44,8 @@ class FakePlatform:
         self.detection_error = detection_error
         self.launches: list[tuple[dict, dict[str, str]]] = []
         self.closed: list[int] = []
+        self.root_pids: dict[str, list[int]] = {}
+        self.command_lines: dict[int, str] = {}
 
     def resolve_executable(self) -> dict[str, str]:
         return {
@@ -57,18 +59,37 @@ class FakePlatform:
             raise OSError("test detection failure")
         return list(self.pids)
 
+    def desktop_processes(self):
+        from gui.desktop_backend import _VerifiedDesktopProcess, _parse_user_data_dir
+        processes = []
+        for pid in self.desktop_pids():
+            command = self.command_lines.get(pid, "")
+            processes.append(
+                _VerifiedDesktopProcess(
+                    pid=pid,
+                    parent_pid=0,
+                    started="fixture",
+                    executable=self.resolve_executable()["path"],
+                    command_line=command,
+                    user_data_dir=_parse_user_data_dir(command),
+                )
+            )
+        return processes
+
     def unknown_desktop_pids(self) -> list[int]:
         return [999] if self.unknown_external else []
 
     def request_close(self, pids: list[int]) -> None:
         self.closed.extend(pids)
-        self.pids = []
+        closed = set(pids)
+        self.pids = [pid for pid in self.pids if pid not in closed]
+        self.command_lines = {pid: command for pid, command in self.command_lines.items() if pid not in closed}
 
     def wait_stopped(self, _timeout: float) -> bool:
         return not self.pids
 
     def force_stop(self, pids: list[int]) -> None:
-        self.pids = [pid for pid in self.pids if pid not in pids]
+        self.request_close(pids)
 
     def launch(self, executable: dict, env: dict[str, str]) -> None:
         self.launches.append((executable, dict(env)))
@@ -77,10 +98,12 @@ class FakePlatform:
         self._complete_launch(env)
 
     def _complete_launch(self, env: dict[str, str]) -> None:
-        self.pids = [303]
+        next_pid = 303 + len(self.launches)
         root = Path(env["CLAUDE_USER_DATA_DIR"])
         if self.ignored_environment:
             root = root.parent / "ignored-by-desktop"
+        self.pids = list(dict.fromkeys([*self.pids, next_pid]))
+        self.command_lines[next_pid] = f'Claude.exe --user-data-dir="{root}"'
         log = root / "Logs" / "main.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         lines = ["account active"]
@@ -164,6 +187,9 @@ class IsolatedDesktopTests(unittest.TestCase):
     def meta(self) -> dict:
         return json.loads(self.backend.meta_file.read_text(encoding="utf-8"))
 
+    def profile_root(self, name: str) -> Path:
+        return self.backend._root_for_entry(name, self.meta()["profiles"][name])
+
     def test_exposes_schema_three_isolated_public_api(self) -> None:
         self.assertEqual(3, desktop_backend.MANIFEST_SCHEMA)
         self.assertEqual("isolated", desktop_backend.StorageMode.ISOLATED.value)
@@ -196,8 +222,8 @@ class IsolatedDesktopTests(unittest.TestCase):
     def test_two_isolated_roots_keep_full_distinct_desktop_data(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
-        alpha = self.cache / "desktop-data" / "alpha"
-        beta = self.cache / "desktop-data" / "beta"
+        alpha = self.profile_root("alpha")
+        beta = self.profile_root("beta")
 
         for relative in ("config.json", "Network/Cookies", "Trusted Devices/device.json", "Partitions/partition.txt", "Local State"):
             self.assertNotEqual((alpha / relative).read_bytes(), (beta / relative).read_bytes())
@@ -207,8 +233,8 @@ class IsolatedDesktopTests(unittest.TestCase):
     def test_switch_copies_no_profile_storage_and_direct_launches_target(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
-        alpha = self.cache / "desktop-data" / "alpha"
-        beta = self.cache / "desktop-data" / "beta"
+        alpha = self.profile_root("alpha")
+        beta = self.profile_root("beta")
         alpha_before = file_digest(alpha)
         beta_before = file_digest(beta)
         self.platform.pids = [101]
@@ -226,6 +252,9 @@ class IsolatedDesktopTests(unittest.TestCase):
         _executable, env = self.platform.launches[-1]
         self.assertEqual(str(alpha), env["CLAUDE_USER_DATA_DIR"])
         self.assertFalse(any("explorer" in str(call).lower() for call in self.platform.launches))
+        self.assertEqual([101], [pid for pid in self.platform.pids if pid == 101] or [101])
+        self.assertIn(101, self.platform.pids)
+        self.assertEqual([], self.platform.closed)
 
     def test_ignored_environment_fails_closed_without_metadata_commit(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
@@ -356,6 +385,8 @@ class IsolatedDesktopTests(unittest.TestCase):
         proof_keys = set(self.meta()["launch_proofs"])
         self.platform.version = "2.0.0"
         self.platform.startup_record = False
+        self.platform.pids = []
+        self.platform.command_lines = {}
 
         result = self.backend.launch_active()
 
@@ -412,12 +443,10 @@ class IsolatedDesktopTests(unittest.TestCase):
         result = self.backend.switch("alpha")
 
         self.assertFalse(result.ok)
-        self.assertEqual(2, len(self.platform.launches))
-        self.assertGreaterEqual(self.platform.closed.count(303), 1)
-        self.assertEqual(
-            str(self.cache / "desktop-data" / "beta"),
-            self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"],
-        )
+        self.assertEqual(1, len(self.platform.launches))
+        self.assertEqual([], self.platform.closed)
+        self.assertIn(101, self.platform.pids)
+        self.assertEqual("beta", self.meta()["desktop_active"])
 
     def test_default_storage_mode_launches_from_the_default_root(self) -> None:
         self.seed_root(self.default_root, account_uuid="uuid-default", organization="org-default")
@@ -465,26 +494,30 @@ class IsolatedDesktopTests(unittest.TestCase):
     def test_history_sync_closes_desktop_and_merges_only_managed_roots(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
-        alpha = self.cache / "desktop-data" / "alpha"
-        beta = self.cache / "desktop-data" / "beta"
+        alpha = self.profile_root("alpha")
+        beta = self.profile_root("beta")
         self._write_history_log(alpha, "workspace", "uuid-a")
         self._write_history_log(beta, "workspace", "uuid-b")
         self._write_history(alpha, "workspace", "uuid-a", "alpha.json", "alpha")
         self._write_history(beta, "workspace", "uuid-b", "beta.json", "beta")
         self.platform.pids = [101]
+        jsonl = self.default_root / "projects" / "alpha.jsonl"
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+        jsonl.write_text("do-not-touch", encoding="utf-8")
 
         report = self.backend.sync_histories()
 
         self.assertTrue(report.ok, report.message)
-        self.assertEqual([], self.platform.pids)
-        self.assertEqual([101], self.platform.closed)
+        self.assertEqual([101], self.platform.pids)
+        self.assertEqual([], self.platform.closed)
+        self.assertEqual("do-not-touch", jsonl.read_text(encoding="utf-8"))
         for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
             folder = root / "claude-code-sessions" / "workspace" / account
             self.assertEqual({"alpha.json", "beta.json"}, {path.name for path in folder.glob("*.json")})
 
     def test_history_sync_rejects_encoded_traversal_segments(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
-        alpha = self.cache / "desktop-data" / "alpha"
+        alpha = self.profile_root("alpha")
         self._write_history_log(alpha, "%2e%2e", "uuid-a")
         outside = self.cache / "desktop-data" / "outside.json"
         outside.write_text("unchanged", encoding="utf-8")
@@ -498,8 +531,8 @@ class IsolatedDesktopTests(unittest.TestCase):
     def test_history_deletion_is_scoped_to_explicit_managed_account_directories(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")
-        alpha = self.cache / "desktop-data" / "alpha"
-        beta = self.cache / "desktop-data" / "beta"
+        alpha = self.profile_root("alpha")
+        beta = self.profile_root("beta")
         for root, account in ((alpha, "uuid-a"), (beta, "uuid-b")):
             self._write_history_log(root, "workspace", account)
         source = self._write_history(alpha, "workspace", "uuid-a", "removed.json", "managed")
@@ -527,6 +560,63 @@ class IsolatedDesktopTests(unittest.TestCase):
         self.assertIsNotNone(result.history)
         self.assertFalse(result.history.ok)
         self.assertEqual("alpha", self.meta()["desktop_active"])
+
+    def test_prepare_and_switch_leave_original_window_running(self) -> None:
+        self.seed_root(self.default_root, account_uuid="uuid-default", organization="org-default")
+        self.platform.pids = [101]
+        self.platform.command_lines[101] = f'Claude.exe --user-data-dir="{self.default_root}"'
+
+        pending = self.backend.begin_new_login()
+        self.seed_root(pending.user_data_dir, account_uuid="uuid-a", organization="org-a")
+        launch = self.backend.launch_active()
+
+        self.assertTrue(launch.ok)
+        self.assertIn(101, self.platform.pids)
+        self.assertEqual([], self.platform.closed)
+        self.assertEqual(str(pending.user_data_dir), self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"])
+
+        profile = self.backend.finalize_current("alpha", "Alpha", "")
+        self.assertTrue(pending.user_data_dir.exists())
+        self.assertEqual(pending.user_data_dir, self.profile_root("alpha"))
+        self.assertEqual(pending.user_data_dir, profile.user_data_dir)
+
+        self.create_profile("beta", "uuid-b", "org-b")
+        result = self.backend.switch("beta")
+        self.assertTrue(result.ok)
+        self.assertIn(101, self.platform.pids)
+        self.assertEqual([], self.platform.closed)
+        self.assertEqual(str(self.profile_root("beta")), self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"])
+
+    def test_switch_to_already_running_profile_does_not_relaunch(self) -> None:
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        alpha = self.profile_root("alpha")
+        self.platform.pids = [202]
+        self.platform.command_lines[202] = f'Claude.exe --user-data-dir="{alpha}"'
+        before = list(self.platform.launches)
+
+        result = self.backend.switch("alpha")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(before, self.platform.launches)
+        self.assertEqual([202], self.platform.pids)
+        self.assertEqual([], self.platform.closed)
+
+    def test_codex_packaged_executable_is_rejected(self) -> None:
+        adapter = desktop_backend.WindowsDesktopProcessAdapter(platform_name="nt")
+        squirrel = Path(r"C:\Users\fixture\AppData\Local\AnthropicClaude\app-1.0.0\Claude.exe")
+        codex = Path(r"C:\Users\fixture\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\AnthropicClaude\app-1.0.0\Claude.exe")
+        rows = json.dumps(
+            [
+                {"ProcessId": 10, "ParentProcessId": 0, "CreationDate": "x", "ExecutablePath": str(squirrel), "CommandLine": str(squirrel)},
+                {"ProcessId": 20, "ParentProcessId": 0, "CreationDate": "y", "ExecutablePath": str(codex), "CommandLine": str(codex)},
+            ]
+        )
+        with patch.object(adapter, "_run", return_value=rows), patch.object(
+            adapter, "_verified_squirrel", return_value=[desktop_backend.ExecutableSpec(squirrel, "1.0.0", "squirrel")]
+        ), patch.object(adapter, "_verified_msix", return_value=[]):
+            with self.assertRaises(OSError):
+                adapter.desktop_pids()
 
 
 class LegacyMigrationTests(unittest.TestCase):
@@ -1151,7 +1241,10 @@ class WindowsExecutableResolutionTests(unittest.TestCase):
         with patch.object(adapter, "_verified_desktop_processes", return_value=[]):
             adapter.launch(executable, environment)
 
-        self.assertEqual([str(executable.path)], popen.call_args.args[0])
+        self.assertEqual(
+            [str(executable.path), "--user-data-dir", environment["CLAUDE_USER_DATA_DIR"]],
+            popen.call_args.args[0],
+        )
         self.assertEqual(environment, popen.call_args.kwargs["env"])
 
 

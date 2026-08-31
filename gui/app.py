@@ -1120,8 +1120,8 @@ class App:
         if not messagebox.askyesno(
             "Save Current Login",
             f"Finalize the pending isolated login as profile '{name}'?\n\n"
-            "Claude Desktop will close so the pending root can be named safely. "
-            "No existing profile root is copied or replaced.",
+            "The pending window stays running. The original Claude window is not "
+            "stopped or copied. No existing profile root is replaced.",
             parent=self.root):
             return
 
@@ -1173,8 +1173,10 @@ class App:
             self._on_relogin_profile(p)
             return
         msg = f"Switch Claude to profile  '{p.name}'?"
-        if self._claude_up:
-            msg += "\n\nClaude is running and will be closed first."
+        msg += (
+            "\n\nThe original Claude window stays running. "
+            "This opens or focuses a second window for the selected profile."
+        )
         if not messagebox.askyesno("Switch Profile", msg, parent=self.root):
             return
 
@@ -1214,8 +1216,9 @@ class App:
         if not messagebox.askyesno(
             "Prepare New Login",
             "Create a fresh isolated Claude Desktop root and open it for a new "
-            "login?\n\nYour active and saved profile roots are not cleared, copied, "
-            "or rewritten. After signing in, click 'Save Current Login'.",
+            "login?\n\nThe original Claude window stays running. A second window "
+            "opens on a new isolated root. After signing in there, click "
+            "'Save Current Login'.",
             parent=self.root):
             return
 
@@ -1226,7 +1229,6 @@ class App:
             pending = None
             try:
                 backend = _desktop_backend()
-                backend.stop_desktop()
                 pending = backend.begin_new_login()
                 try:
                     launch = backend.launch_active()
@@ -1252,8 +1254,8 @@ class App:
 
     def _on_sync_histories(self):
         """Merge Claude Code + agent-mode history across every account so all
-        profiles share one project list / session history. Closes Claude first
-        (file safety), then redistributes the union into each account's folder."""
+        profiles share one project list / session history. Leaves Claude running
+        and never rewrites conversation JSONL files."""
         if not self._action_ready():
             return
         if not messagebox.askyesno(
@@ -1262,7 +1264,8 @@ class App:
             "combined project list and history are visible under any profile.\n\n"
             "• Newest copy wins; user-deleted conversations stay deleted.\n"
             "• A local history backup is made before deletions propagate.\n"
-            "• Claude will be closed first if it's running.\n\n"
+            "• The original Claude window stays running.\n"
+            "• Conversation JSONL files are not rewritten.\n\n"
             "Continue?", parent=self.root):
             return
         self._busy = True
@@ -1513,7 +1516,9 @@ class App:
     def _on_stop(self):
         if not self._action_ready():
             return
-        if not messagebox.askyesno("Stop Claude", "Close Claude Desktop?",
+        if not messagebox.askyesno(
+            "Stop Claude",
+            "Close the selected profile window? The original Claude window is not stopped.",
                                    parent=self.root):
             return
         self._busy = True
