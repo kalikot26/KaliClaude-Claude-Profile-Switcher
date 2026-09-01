@@ -81,6 +81,15 @@ class CliPairResult:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class CliUnpairResult:
+    ok: bool
+    profile: str
+    parked_store: str = ""
+    parked_live: str = ""
+    message: str = ""
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -342,6 +351,41 @@ class CliBackend:
             ok=False, profile=profile, timed_out=True,
             message="Timed out waiting for a CLI login.")
 
+    def unpair(self, profile: str, sign_out_live: bool = False) -> CliUnpairResult:
+        """Detach a profile's paired CLI login so another account can pair.
+
+        Parks the profile's store (recoverable dir move, None-safe when
+        unpaired) and, when ``sign_out_live``, verified-MOVEs the live
+        credentials into a fresh unclaimed store — the CLI is signed out but
+        the login stays recoverable. Never deletes; the only unlink is the
+        verified-move source.
+        """
+        parked_store = self.retire_store(profile)  # None when nothing is paired
+
+        parked_live = ""
+        if sign_out_live and self.live_creds.is_file():
+            parked_live = self._unclaimed_name("live")
+            store = self._store_dir(parked_live)
+            _move_file(self.live_creds, store / CREDS_NAME)
+            self._write_account(store, self._harvest_account())  # best-effort
+
+        if parked_store is None and not parked_live:
+            return CliUnpairResult(
+                ok=True, profile=profile,
+                message=f"No paired CLI login for '{profile}'; nothing needed parking.")
+
+        parked_store_name = parked_store.name if parked_store else ""
+        parts = []
+        if parked_store_name:
+            parts.append(f"parked its stored login in cli-data\\{parked_store_name}")
+        if parked_live:
+            parts.append(
+                f"signed out the live CLI (recoverable in cli-data\\{parked_live})")
+        return CliUnpairResult(
+            ok=True, profile=profile,
+            parked_store=parked_store_name, parked_live=parked_live,
+            message=f"Unpaired '{profile}' — " + "; ".join(parts) + ".")
+
     # ----- store lifecycle (recoverable dir moves, same volume) -------------
 
     def rename_store(self, old: str, new: str) -> Optional[Path]:
@@ -397,6 +441,10 @@ def switch_to(target: str, outgoing: str) -> CliSwitchResult:
 
 def pair(profile: str, expected_account_sha256: str = "") -> CliPairResult:
     return _default().pair(profile, expected_account_sha256)
+
+
+def unpair(profile: str, sign_out_live: bool = False) -> CliUnpairResult:
+    return _default().unpair(profile, sign_out_live)
 
 
 def rename_store(old: str, new: str) -> Optional[Path]:
