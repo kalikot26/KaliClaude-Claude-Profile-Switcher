@@ -270,6 +270,64 @@ class CliBackendTests(unittest.TestCase):
         self.assertEqual(b"ALPHA", (destination / CREDS).read_bytes())
         self.assertIsNone(backend.retire_store("never-existed"))
 
+    # ----- unpair -----------------------------------------------------------
+
+    def test_unpair_paired_parks_store_bytes_intact(self) -> None:
+        backend = self.make()
+        self.write_store("beta", creds=b"BETA-CREDS")
+
+        result = backend.unpair("beta")
+
+        self.assertTrue(result.ok and result.parked_store)
+        self.assertEqual("", result.parked_live)
+        self.assertFalse(self.cli_data("beta").exists())
+        self.assertEqual(
+            b"BETA-CREDS", (self.cli_data(result.parked_store) / CREDS).read_bytes())
+        self.assert_no_tmp()
+
+    def test_unpair_sign_out_live_also_parks_live_intact(self) -> None:
+        backend = self.make()
+        self.write_store("beta", creds=b"BETA-CREDS")
+        self.write_live(b"LIVE-A")
+
+        result = backend.unpair("beta", sign_out_live=True)
+
+        self.assertTrue(result.ok and result.parked_store and result.parked_live)
+        self.assertFalse(backend.live_creds.exists())  # CLI signed out, recoverable
+        self.assertEqual(
+            b"BETA-CREDS", (self.cli_data(result.parked_store) / CREDS).read_bytes())
+        self.assertEqual(
+            b"LIVE-A", (self.cli_data(result.parked_live) / CREDS).read_bytes())
+        self.assert_no_tmp()
+
+    def test_unpair_unpaired_without_live_is_noop(self) -> None:
+        backend = self.make()
+
+        result = backend.unpair("beta", sign_out_live=True)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("", result.parked_store)
+        self.assertEqual("", result.parked_live)
+        self.assertIn("nothing needed parking", result.message)
+
+    def test_unpair_live_absent_signs_out_nothing(self) -> None:
+        backend = self.make()
+        self.write_store("beta", creds=b"BETA-CREDS")  # paired, but no live file
+
+        result = backend.unpair("beta", sign_out_live=True)
+
+        self.assertTrue(result.ok and result.parked_store)
+        self.assertEqual("", result.parked_live)  # no live file to sign out
+
+    def test_unpair_then_pair_info_reports_unpaired(self) -> None:
+        backend = self.make()
+        self.write_store("beta", creds=b"BETA", account={"emailAddress": "b@example.invalid"})
+        self.assertTrue(backend.pair_info("beta").paired)
+
+        backend.unpair("beta")
+
+        self.assertFalse(backend.pair_info("beta").paired)
+
 
 if __name__ == "__main__":
     unittest.main()
