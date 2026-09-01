@@ -40,6 +40,11 @@ except ImportError:  # PyInstaller runs gui/app.py as the entry script.
         SwitchResult,
     )
 
+try:
+    from .cli_backend import CliBackend
+except ImportError:  # PyInstaller runs gui/app.py as the entry script.
+    from cli_backend import CliBackend  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Theme — warm dark, Claude vibe
 # ---------------------------------------------------------------------------
@@ -156,6 +161,16 @@ def _desktop_backend() -> DesktopBackend:
     if _DESKTOP_BACKEND is None:
         _DESKTOP_BACKEND = DesktopBackend()
     return _DESKTOP_BACKEND
+
+
+_CLI_BACKEND: Optional[CliBackend] = None
+
+
+def _cli_backend() -> CliBackend:
+    global _CLI_BACKEND
+    if _CLI_BACKEND is None:
+        _CLI_BACKEND = CliBackend()
+    return _CLI_BACKEND
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +417,12 @@ def _start_ipc(on_focus) -> None:
 
 class Profile:
     __slots__ = ("name", "label", "note", "updated", "fp", "is_active",
-                 "has_blob", "email", "plan", "usage", "state", "issue")
+                 "has_blob", "email", "plan", "usage", "state", "issue",
+                 "cli_paired", "cli_email")
 
     def __init__(self, name, label, note, updated, fp, is_active, has_blob,
                  email="", plan="", usage=None, state=ProfileState.READY,
-                 issue=""):
+                 issue="", cli_paired=False, cli_email=""):
         self.name = name
         self.label = label
         self.note = note
@@ -419,6 +435,8 @@ class Profile:
         self.usage = usage or {}
         self.state = state
         self.issue = issue
+        self.cli_paired = cli_paired
+        self.cli_email = cli_email
 
 
 PROFILE_STATE_LABELS = {
@@ -441,7 +459,7 @@ def _list_profiles() -> list[Profile]:
             ProfileState.READY,
             ProfileState.NEEDS_VALIDATION,
         )
-        out.append(Profile(
+        profile = Profile(
             name=name,
             label=saved.label,
             note=saved.note,
@@ -454,7 +472,14 @@ def _list_profiles() -> list[Profile]:
             usage=info.get("usage") or {},
             state=saved.state,
             issue=saved.issue,
-        ))
+        )
+        try:  # bare guard: the CLI layer can never break profile listing
+            cli_info = _cli_backend().pair_info(name)
+            profile.cli_paired = cli_info.paired
+            profile.cli_email = cli_info.email
+        except Exception:
+            pass
+        out.append(profile)
     return out
 
 def _rel_time(ts: float) -> str:
@@ -688,6 +713,7 @@ class App:
         self._email_row = self._meta_row(meta, "Email")
         self._plan_row  = self._meta_row(meta, "Plan")
         self._saved_row = self._meta_row(meta, "Login state")
+        self._cli_row   = self._meta_row(meta, "CLI login")
 
         tk.Frame(self._content, bg=CLR_DIV, height=1).pack(
             fill=tk.X, padx=32, pady=(10, 10))
@@ -736,6 +762,8 @@ class App:
         self._btn_rename.pack(side=tk.LEFT, padx=(0, 8))
         self._btn_remove = _btn(act, "Remove", self._on_remove, danger=True)
         self._btn_remove.pack(side=tk.LEFT)
+        self._btn_pair_cli = _btn(act, "Pair CLI", self._on_pair_cli)
+        self._btn_pair_cli.pack(side=tk.LEFT, padx=(8, 0))
 
         hint = tk.Label(
             self._content,
@@ -845,6 +873,8 @@ class App:
             meta, meta_color = f"Ready · saved {_rel_time(p.updated)}", TXT_MUTE
         else:
             meta, meta_color = PROFILE_STATE_LABELS[p.state], CLR_WARN
+        if p.cli_paired:
+            meta += "  ·  CLI"
         tk.Label(inner, text=meta, bg=cbg,
                  fg=meta_color,
                  font=(FF, 7), anchor="w").pack(fill=tk.X, pady=(3, 0))
@@ -896,6 +926,10 @@ class App:
         self._saved_row.configure(
             text=snapshot_text,
             fg=TXT_SUB if p.has_blob else CLR_WARN)
+        if p.cli_paired:
+            self._cli_row.configure(text=p.cli_email or "paired", fg=CLR_OK)
+        else:
+            self._cli_row.configure(text="not paired", fg=TXT_MUTE)
         self._note.configure(state=tk.NORMAL)
         self._note.delete("1.0", tk.END); self._note.insert("1.0", p.note)
         self._note.configure(state=tk.DISABLED)
@@ -927,6 +961,10 @@ class App:
         self._btn_remove.configure(
             state=tk.NORMAL if actions_enabled else tk.DISABLED,
             fg=CLR_ERR if actions_enabled else TXT_MUTE)
+        cli_enabled = actions_enabled and p.is_active
+        self._btn_pair_cli.configure(
+            state=tk.NORMAL if cli_enabled else tk.DISABLED,
+            fg=TXT_PRI if cli_enabled else TXT_MUTE)
         self._refresh_claude_ui()
 
     def _render_usage(self, p: Profile):
@@ -1180,6 +1218,7 @@ class App:
         msg += (
             "\n\nThis opens or focuses a second Claude window using only the selected "
             "isolated profile root. The default Desktop root is not used."
+            "\n\nClose Claude Code CLI sessions first for a clean account swap."
         )
         if not messagebox.askyesno("Switch Profile", msg, parent=self.root):
             return
@@ -1189,11 +1228,18 @@ class App:
                                    bg=BG_CARD, fg=TXT_MUTE)
         self._set_status(f"Switching to {p.name}…")
         target = p.name
+        outgoing = next((q.name for q in self._profiles if q.is_active), "")
 
         def work():
             try:
                 result = _desktop_backend().switch(target)
                 self._q.put(("switch_ok", result))
+                # CLI partner swap: strictly after the desktop switch, fully
+                # guarded — an exception here must never touch the desktop result.
+                try:
+                    self._q.put(("cli_switch", _cli_backend().switch_to(target, outgoing)))
+                except Exception as cli_error:
+                    self._q.put(("cli_switch", str(cli_error) or type(cli_error).__name__))
             except RollbackError as error:
                 self._q.put(("rollback_err", (str(error), str(error.recovery_path))))
             except Exception as e:
@@ -1284,6 +1330,41 @@ class App:
                 }))
             except Exception as e:
                 self._q.put(("sync_err", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pair_cli(self):
+        if not self._action_ready(require_selection=True):
+            return
+        p = self._profiles[self._sel]
+        if not p.is_active:
+            messagebox.showinfo(
+                "Pair CLI",
+                "Pair the Claude Code CLI while this profile is the active one — "
+                "pairing captures or creates the CLI login that belongs to it.",
+                parent=self.root)
+            return
+        self._start_cli_pair(p.name)
+
+    def _start_cli_pair(self, name):
+        if not messagebox.askyesno(
+            "Pair Claude Code CLI",
+            f"Pair the Claude Code CLI login with profile '{name}'?\n\n"
+            "A terminal window opens for you to log in. If no login prompt "
+            "appears, type /login. Closing the terminal cancels pairing.",
+            parent=self.root):
+            return
+        expected = _load_meta().get("profiles", {}).get(name, {}).get(
+            "account_id_sha256", "")
+        self._busy = True
+        self._set_status(
+            f"Pairing CLI for '{name}' — a terminal opened; close it to cancel.")
+
+        def work():
+            try:
+                self._q.put(("cli_pair_ok", _cli_backend().pair(name, expected)))
+            except Exception as error:
+                self._q.put(("cli_pair_err", str(error) or type(error).__name__))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1443,6 +1524,28 @@ class App:
             self._busy = False
             messagebox.showerror("Sync Failed", data, parent=self.root)
             self._set_status(f"Sync failed: {data}")
+        elif kind == "cli_switch":
+            self._handle_cli_switch(data)
+        elif kind == "cli_pair_ok":
+            self._busy = False
+            result = data
+            if result.ok:
+                extra = ("\n\n" + "\n".join(result.warnings)) if result.warnings else ""
+                self._set_status(f"CLI paired for '{result.profile}'.")
+                messagebox.showinfo(
+                    "CLI Paired",
+                    f"The Claude Code CLI is paired with '{result.profile}'." + extra,
+                    parent=self.root)
+            else:
+                self._set_status(f"CLI pairing not completed: {result.message}")
+                messagebox.showwarning(
+                    "CLI Pairing Incomplete",
+                    result.message or "Pairing did not complete.", parent=self.root)
+            self._refresh()
+        elif kind == "cli_pair_err":
+            self._busy = False
+            messagebox.showwarning("CLI Pairing Failed", data, parent=self.root)
+            self._set_status(f"CLI pairing failed: {data}")
         elif kind == "tick":
             self._apply_tick(*data)
             self.root.after(5000, self._tick)
@@ -1502,6 +1605,38 @@ class App:
             if 0 <= self._sel < len(self._profiles):
                 self._render_usage(self._profiles[self._sel])
 
+    def _handle_cli_switch(self, data):
+        """CLI partner result — warnings only; the desktop switch already stands."""
+        if isinstance(data, str):
+            self._set_status(f"Desktop switched; CLI account not swapped: {data}")
+            messagebox.showwarning(
+                "CLI Account Not Swapped",
+                "The Desktop profile switch succeeded and remains active, but the "
+                f"Claude Code CLI account could not be swapped:\n\n{data}",
+                parent=self.root)
+            return
+        result = data
+        if result.warnings:
+            messagebox.showwarning(
+                "CLI Account Warning",
+                "The Desktop switch succeeded. Note about the CLI account:\n\n"
+                + "\n".join(result.warnings),
+                parent=self.root)
+        if result.needs_login:
+            if messagebox.askyesno(
+                "CLI Sign-in Needed",
+                f"'{result.target}' has no stored Claude Code CLI login, so the CLI "
+                "is now signed out. Pair it now?",
+                parent=self.root):
+                self._start_cli_pair(result.target)
+            else:
+                self._set_status(f"Switched; CLI signed out for '{result.target}'.")
+        else:
+            self._set_status(
+                f"Switched; CLI account now '{result.target}'. Any running CLI "
+                "session bills this account from its next request.")
+        self._refresh()
+
     def _on_rename(self):
         if not self._action_ready(require_selection=True):
             return
@@ -1517,6 +1652,10 @@ class App:
         def work():
             try:
                 _desktop_backend().rename_profile(old_name, new_name)
+                try:  # keep the CLI store attached to the renamed profile
+                    _cli_backend().rename_store(old_name, new_name)
+                except Exception:
+                    pass
                 self._q.put(("rename_ok", (old_name, new_name)))
             except Exception as error:
                 self._q.put(("rename_err", str(error) or type(error).__name__))
@@ -1540,6 +1679,10 @@ class App:
         def work():
             try:
                 retained = _desktop_backend().remove_profile(name)
+                try:  # park stale CLI creds so a recycled name can't inherit them
+                    _cli_backend().retire_store(name)
+                except Exception:
+                    pass
                 self._q.put(("remove_ok", (name, str(retained) if retained else "")))
             except Exception as error:
                 self._q.put(("remove_err", str(error) or type(error).__name__))
