@@ -764,6 +764,8 @@ class App:
         self._btn_remove.pack(side=tk.LEFT)
         self._btn_pair_cli = _btn(act, "Pair CLI", self._on_pair_cli)
         self._btn_pair_cli.pack(side=tk.LEFT, padx=(8, 0))
+        self._btn_unpair_cli = _btn(act, "Unpair CLI", self._on_unpair_cli)
+        self._btn_unpair_cli.pack(side=tk.LEFT, padx=(8, 0))
 
         hint = tk.Label(
             self._content,
@@ -965,6 +967,10 @@ class App:
         self._btn_pair_cli.configure(
             state=tk.NORMAL if cli_enabled else tk.DISABLED,
             fg=TXT_PRI if cli_enabled else TXT_MUTE)
+        unpair_enabled = actions_enabled and p.cli_paired
+        self._btn_unpair_cli.configure(
+            state=tk.NORMAL if unpair_enabled else tk.DISABLED,
+            fg=TXT_PRI if unpair_enabled else TXT_MUTE)
         self._refresh_claude_ui()
 
     def _render_usage(self, p: Profile):
@@ -1368,6 +1374,36 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_unpair_cli(self):
+        if not self._action_ready(require_selection=True):
+            return
+        p = self._profiles[self._sel]
+        if not p.cli_paired:
+            return
+        active = p.is_active
+        detail = ("The saved CLI login is parked recoverably under "
+                  "cli-data\\_unclaimed-* — you can re-pair anytime with 'Pair CLI'.")
+        if active:
+            detail += ("\n\nThis profile is active, so the live Claude Code CLI "
+                       "signs out immediately.")
+        if not messagebox.askyesno(
+            "Unpair Claude Code CLI",
+            f"Detach the Claude Code CLI login from profile '{p.name}'?\n\n" + detail,
+            parent=self.root):
+            return
+        name = p.name
+        self._busy = True
+        self._set_status(f"Unpairing CLI for '{name}'…")
+
+        def work():
+            try:
+                self._q.put(
+                    ("cli_unpair_ok", _cli_backend().unpair(name, sign_out_live=active)))
+            except Exception as error:
+                self._q.put(("cli_unpair_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _pump(self):
         """Single persistent dispatcher for background-thread results."""
         try:
@@ -1546,6 +1582,20 @@ class App:
             self._busy = False
             messagebox.showwarning("CLI Pairing Failed", data, parent=self.root)
             self._set_status(f"CLI pairing failed: {data}")
+        elif kind == "cli_unpair_ok":
+            self._busy = False
+            result = data
+            self._set_status(result.message)
+            messagebox.showinfo(
+                "CLI Unpaired",
+                result.message + "\n\nRe-pair this profile anytime with 'Pair CLI'.",
+                parent=self.root)
+            self._refresh()
+        elif kind == "cli_unpair_err":
+            self._busy = False
+            messagebox.showwarning("CLI Unpair Failed", data, parent=self.root)
+            self._set_status(f"CLI unpair failed: {data}")
+            self._refresh()
         elif kind == "tick":
             self._apply_tick(*data)
             self.root.after(5000, self._tick)
