@@ -584,8 +584,9 @@ class CliBackend:
                     ok=True, name=name, email=account.email,
                     message=f"Added pool account '{name}'.")
             if process.poll() is not None:
-                # ponytail: the empty pool\<name> dir is left behind (recoverable,
-                # never deleted); Remove parks it, or re-add after removing it.
+                # ponytail: the empty pool\<name> dir is left behind (never
+                # deleted). It never entered the order, so re-adding the same
+                # name just reuses the dir and completes; Remove parks it.
                 return PoolAddResult(
                     ok=False, name=name, cancelled=True,
                     message="The login terminal closed before a login completed.")
