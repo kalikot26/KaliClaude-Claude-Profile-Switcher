@@ -335,6 +335,25 @@ class GuiContractTests(unittest.TestCase):
         desktop.stop_desktop.assert_not_called()
         self.assertTrue(app._q.empty())
 
+    def test_unpair_handler_signs_out_active_profile_and_enqueues_ok(self) -> None:
+        app = self.make_app()
+        app._profiles = [app_module.Profile(
+            "alpha", "A", "", 1.0, "h", True, True,
+            state=ProfileState.ACTIVE, cli_paired=True)]
+        app._sel = 0
+        cli = Mock()
+        cli.unpair.return_value = SimpleNamespace(
+            ok=True, profile="alpha", parked_store="_unclaimed-x",
+            parked_live="_unclaimed-live", message="Unpaired 'alpha'.")
+
+        with patch.object(app_module, "_cli_backend", return_value=cli), patch.object(
+            app_module.messagebox, "askyesno", return_value=True
+        ), patch.object(app_module.threading, "Thread", ImmediateThread):
+            app._on_unpair_cli()
+
+        cli.unpair.assert_called_once_with("alpha", sign_out_live=True)
+        self.assertEqual("cli_unpair_ok", app._q.get_nowait()[0])
+
 
 if __name__ == "__main__":
     unittest.main()
