@@ -10,6 +10,8 @@ from unittest.mock import patch
 from gui.cli_backend import CliBackend, CliBackendError
 from gui.desktop_backend import _sha256
 
+POOL = "pool"
+
 CREDS = ".credentials.json"
 
 
@@ -27,16 +29,26 @@ class FakeSpawner:
         self.payload = payload
         self.polls = 0
         self.argv = None
+        self.env = None
 
-    def __call__(self, argv):
+    def __call__(self, argv, env=None):
         self.argv = argv
+        self.env = env
         return self
+
+    def _target(self) -> Path:
+        # A pool login writes into the child's isolated CLAUDE_CONFIG_DIR; the
+        # partner-model pair login writes the shared live store.
+        if self.env and self.env.get("CLAUDE_CONFIG_DIR"):
+            return Path(self.env["CLAUDE_CONFIG_DIR"]) / CREDS
+        return self.live_creds
 
     def poll(self):
         self.polls += 1
         if self.create_on is not None and self.polls >= self.create_on:
-            self.live_creds.parent.mkdir(parents=True, exist_ok=True)
-            self.live_creds.write_bytes(self.payload)
+            target = self._target()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.payload)
         if self.exit_on is not None and self.polls >= self.exit_on:
             return 0
         return None
@@ -49,7 +61,8 @@ class CliBackendTests(unittest.TestCase):
         # A clean environment so os.environ never masks the injected registry.
         self._env = patch.dict(os.environ, {}, clear=False)
         self._env.start()
-        for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                     "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"):
             os.environ.pop(name, None)
 
     def tearDown(self) -> None:
@@ -327,6 +340,134 @@ class CliBackendTests(unittest.TestCase):
         backend.unpair("beta")
 
         self.assertFalse(backend.pair_info("beta").paired)
+
+    # ----- pool -------------------------------------------------------------
+
+    def pool(self, *parts) -> Path:
+        return self.cli_data(POOL).joinpath(*parts)
+
+    def pool_order(self) -> list:
+        return json.loads(self.pool("pool.json").read_text())["order"]
+
+    def test_pool_add_harvests_identity_and_appends_order(self) -> None:
+        self.write_claude_json(uuid="POOL-UUID", email="pool@example.invalid")
+        spawner = FakeSpawner(self.home / ".claude" / CREDS, create_on=1, payload=b"POOL-CREDS")
+        backend = self.make(spawner=spawner, which=lambda name: "C:/fake/claude.exe")
+
+        result = backend.pool_add("work")
+
+        self.assertTrue(result.ok and not result.cancelled and not result.timed_out)
+        self.assertEqual("pool@example.invalid", result.email)
+        self.assertEqual(["cmd.exe", "/k", str(Path("C:/fake/claude.exe"))], spawner.argv)
+        self.assertEqual(str(self.pool("work")), spawner.env["CLAUDE_CONFIG_DIR"])
+        self.assertEqual(b"POOL-CREDS", (self.pool("work") / CREDS).read_bytes())
+        self.assertEqual(["work"], self.pool_order())
+        account = backend.pool_list()[0]
+        self.assertTrue(account.logged_in)
+        self.assertEqual("pool@example.invalid", account.email)
+        self.assertEqual("POOL-UUID", account.account_uuid)
+        self.assert_no_tmp()
+
+    def test_pool_add_refuses_duplicate(self) -> None:
+        backend = self.make(which=lambda name: "claude")
+        backend._write_pool_order(["work"])
+        with self.assertRaises(CliBackendError):
+            backend.pool_add("work")
+
+    def test_pool_add_refuses_invalid_names(self) -> None:
+        backend = self.make(which=lambda name: "claude")
+        for bad in ("bad name", "has/slash", "", "a" * 65, "no.dots"):
+            with self.subTest(bad=bad), self.assertRaises(CliBackendError):
+                backend.pool_add(bad)
+
+    def test_pool_add_refuses_underscore_prefix(self) -> None:
+        backend = self.make(which=lambda name: "claude")
+        with self.assertRaises(CliBackendError):
+            backend.pool_add("_retired-x")
+
+    def test_pool_add_cancelled_when_terminal_closes(self) -> None:
+        spawner = FakeSpawner(self.home / ".claude" / CREDS, exit_on=1)
+        backend = self.make(spawner=spawner, which=lambda name: "claude")
+
+        result = backend.pool_add("work")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.cancelled)
+        self.assertFalse(self.pool("pool.json").exists())  # never added to order
+
+    def test_pool_add_times_out(self) -> None:
+        spawner = FakeSpawner(self.home / ".claude" / CREDS)  # never creates, never exits
+        backend = self.make(spawner=spawner, which=lambda name: "claude",
+                            pair_timeout=0.05, pair_interval=0.01)
+
+        result = backend.pool_add("work")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.timed_out)
+
+    def test_pool_retire_parks_bytes_intact_and_drops_order(self) -> None:
+        backend = self.make()
+        self.pool("work").mkdir(parents=True)
+        (self.pool("work") / CREDS).write_bytes(b"WORK-CREDS")
+        backend._write_pool_order(["work", "home"])
+
+        destination = backend.pool_retire("work")
+
+        self.assertIsNotNone(destination)
+        self.assertTrue(destination.name.startswith("_retired-"))
+        self.assertTrue(destination.name.endswith("-work"))
+        self.assertFalse(self.pool("work").exists())
+        self.assertEqual(b"WORK-CREDS", (destination / CREDS).read_bytes())
+        self.assertEqual(["home"], backend._pool_order())
+        self.assertIsNone(backend.pool_retire("never-existed"))
+
+    def test_pool_move_reorders_and_clamps(self) -> None:
+        backend = self.make()
+        backend._write_pool_order(["a", "b", "c"])
+
+        self.assertEqual(["b", "a", "c"], backend.pool_move("a", 1))
+        self.assertEqual(["b", "a", "c"], backend.pool_move("b", -1))   # clamp at top
+        self.assertEqual(["b", "a", "c"], backend.pool_move("c", 1))    # clamp at bottom
+        self.assertEqual(["b", "c", "a"], backend.pool_move("c", -1))
+        self.assertEqual(["b", "c", "a"], backend.pool_move("missing", 1))  # no-op
+        self.assertEqual(["b", "c", "a"], self.pool_order())
+
+    def test_pool_list_merges_strays_and_excludes_retired(self) -> None:
+        backend = self.make()
+        self.pool("work").mkdir(parents=True)
+        (self.pool("work") / CREDS).write_bytes(b"W")
+        (self.pool("work") / "account.json").write_text(
+            json.dumps({"emailAddress": "w@example.invalid"}))
+        self.pool("stray").mkdir(parents=True)               # on-disk, no creds
+        self.pool("_retired-20200101-000000-old").mkdir(parents=True)
+        backend._write_pool_order(["work"])
+
+        accounts = backend.pool_list()
+        names = [account.name for account in accounts]
+
+        self.assertEqual(["work", "stray"], names)           # order first, stray appended
+        self.assertTrue(accounts[0].logged_in)
+        self.assertEqual("w@example.invalid", accounts[0].email)
+        self.assertFalse(accounts[1].logged_in)              # stray is signed out
+        self.assertNotIn("_retired-20200101-000000-old", names)
+
+    def test_pool_install_launcher_writes_both_files_with_failover_markers(self) -> None:
+        backend = self.make()
+
+        ps1 = backend.pool_install_launcher()
+
+        self.assertEqual("claude-pool.ps1", ps1.name)
+        self.assertTrue(ps1.is_file())
+        cmd = ps1.with_name("claude-pool.cmd")
+        self.assertTrue(cmd.is_file())
+        ps1_text = ps1.read_text(encoding="utf-8")
+        self.assertIn("failing over", ps1_text)
+        self.assertIn("served by", ps1_text)
+        self.assertIn("all accounts exhausted", ps1_text)
+        self.assertIn(r"\b429\b", ps1_text)                  # limit-regex fragment
+        self.assertIn("CLAUDE_CONFIG_DIR", ps1_text)
+        self.assertIn(str(self.pool("pool.json")), ps1_text)  # concrete pool path injected
+        self.assertIn("claude-pool.ps1", cmd.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

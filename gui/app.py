@@ -550,6 +550,7 @@ class App:
         self._startup_error = ""
         self._migration_report = None
         self._email_cache: dict[str, str] = {}
+        self._pool_dialog = None
 
         try:
             self._migration_report = _desktop_backend().audit_and_migrate()
@@ -766,6 +767,9 @@ class App:
         self._btn_pair_cli.pack(side=tk.LEFT, padx=(8, 0))
         self._btn_unpair_cli = _btn(act, "Unpair CLI", self._on_unpair_cli)
         self._btn_unpair_cli.pack(side=tk.LEFT, padx=(8, 0))
+        # Always enabled: the pool is independent of the selected profile.
+        self._btn_cli_pool = _btn(act, "CLI Pool…", self._on_cli_pool)
+        self._btn_cli_pool.pack(side=tk.LEFT, padx=(8, 0))
 
         hint = tk.Label(
             self._content,
@@ -1404,6 +1408,46 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_cli_pool(self):
+        # Guarded so a pool-layer fault can never break the main window.
+        try:
+            dialog = getattr(self, "_pool_dialog", None)
+            if dialog is not None:
+                try:
+                    if dialog.top.winfo_exists():
+                        dialog.top.lift()
+                        return
+                except Exception:
+                    pass
+            self._pool_dialog = CliPoolDialog(self)
+        except Exception as error:
+            messagebox.showwarning(
+                "CLI Pool", str(error) or type(error).__name__, parent=self.root)
+
+    def _start_pool_add(self, name):
+        """Add a pool account on a worker thread (a login terminal opens)."""
+        self._busy = True
+        self._set_status(
+            f"Adding pool account '{name}' — a terminal opened; close it to cancel.")
+
+        def work():
+            try:
+                self._q.put(("pool_add_ok", _cli_backend().pool_add(name)))
+            except Exception as error:
+                self._q.put(("pool_add_err", str(error) or type(error).__name__))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reload_pool_dialog(self):
+        dialog = getattr(self, "_pool_dialog", None)
+        if dialog is None:
+            return
+        try:
+            if dialog.top.winfo_exists():
+                dialog._reload()
+        except Exception:
+            pass
+
     def _pump(self):
         """Single persistent dispatcher for background-thread results."""
         try:
@@ -1596,6 +1640,28 @@ class App:
             messagebox.showwarning("CLI Unpair Failed", data, parent=self.root)
             self._set_status(f"CLI unpair failed: {data}")
             self._refresh()
+        elif kind == "pool_add_ok":
+            self._busy = False
+            result = data
+            if result.ok:
+                self._set_status(f"Added pool account '{result.name}'.")
+                messagebox.showinfo(
+                    "Pool Account Added",
+                    f"Added '{result.name}'"
+                    + (f" ({result.email})" if result.email else "")
+                    + " to the CLI pool.",
+                    parent=self.root)
+            else:
+                self._set_status(f"Pool add not completed: {result.message}")
+                messagebox.showwarning(
+                    "Pool Add Incomplete",
+                    result.message or "The account was not added.", parent=self.root)
+            self._reload_pool_dialog()
+        elif kind == "pool_add_err":
+            self._busy = False
+            messagebox.showwarning("Pool Add Failed", data, parent=self.root)
+            self._set_status(f"Pool add failed: {data}")
+            self._reload_pool_dialog()
         elif kind == "tick":
             self._apply_tick(*data)
             self.root.after(5000, self._tick)
@@ -1912,6 +1978,155 @@ class RenameDialog(_BaseDialog):
             return
         self.result = (name, self._label.get().strip())
         self.top.destroy()
+
+
+class CliPoolDialog(_BaseDialog):
+    """Manage the CLI pool: several simultaneously-logged-in CLI accounts.
+
+    Every cli_backend call is guarded so a pool-layer fault can only affect
+    this dialog, never the main window. Add runs on the app's worker+queue;
+    the file-local quick ops (list/retire/move/install) run inline.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        parent = app.root
+        t = self.top = tk.Toplevel(parent)
+        t.title("CLI Pool"); t.configure(bg=BG_PANEL)
+        t.resizable(False, False); t.grab_set(); t.transient(parent)
+        try: t.iconbitmap(str(ICON_PATH))
+        except Exception: pass
+        self._center(parent, 540, 480)
+        self._header("CLI Pool")
+
+        body = tk.Frame(t, bg=BG_PANEL)
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(14, 18))
+        tk.Label(
+            body,
+            text="Each account keeps its own isolated CLI login "
+                 "(CLAUDE_CONFIG_DIR), so they stay signed in side by side. "
+                 "Install the launcher to run them in order with automatic "
+                 "failover when one hits a usage limit.",
+            bg=BG_PANEL, fg=TXT_SUB, font=(FF, 9), justify=tk.LEFT,
+            wraplength=490, anchor="w").pack(fill=tk.X, pady=(0, 10))
+
+        self._list = tk.Listbox(
+            body, height=10, font=(FF, 10), bg=BG_INPUT, fg=TXT_PRI,
+            relief=tk.FLAT, bd=0, highlightbackground=CLR_DIV,
+            highlightthickness=1, selectbackground=CLR_ACCENT,
+            selectforeground="#17140F", activestyle="none")
+        self._list.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        row1 = tk.Frame(body, bg=BG_PANEL); row1.pack(fill=tk.X)
+        _btn(row1, "Add Account", self._on_add, accent=True).pack(
+            side=tk.LEFT, padx=(0, 6))
+        _btn(row1, "Remove", self._on_remove, danger=True).pack(
+            side=tk.LEFT, padx=(0, 6))
+        _btn(row1, "Move Up", lambda: self._move(-1)).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(row1, "Move Down", lambda: self._move(1)).pack(side=tk.LEFT, padx=(0, 6))
+
+        row2 = tk.Frame(body, bg=BG_PANEL); row2.pack(fill=tk.X, pady=(8, 0))
+        _btn(row2, "Install Launcher", self._on_install).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(row2, "Refresh", self._reload).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(row2, "Close", t.destroy).pack(side=tk.RIGHT)
+
+        t.bind("<Escape>", lambda _: t.destroy())
+        self._accounts = []
+        self._reload()
+
+    def _reload(self):
+        try:
+            self._accounts = _cli_backend().pool_list()
+        except Exception as error:
+            self._accounts = []
+            self.app._set_status(
+                f"CLI pool list failed: {str(error) or type(error).__name__}")
+        self._list.delete(0, tk.END)
+        for i, account in enumerate(self._accounts, start=1):
+            label = account.email or "signed out"
+            self._list.insert(tk.END, f"{i}. {account.name} — {label}")
+
+    def _selected_name(self):
+        selection = self._list.curselection()
+        if not selection or selection[0] >= len(self._accounts):
+            return None
+        return self._accounts[selection[0]].name
+
+    def _select(self, name):
+        for i, account in enumerate(self._accounts):
+            if account.name == name:
+                self._list.selection_clear(0, tk.END)
+                self._list.selection_set(i)
+                return
+
+    def _on_add(self):
+        if self.app._busy:
+            messagebox.showinfo(
+                "CLI Pool", "Another operation is in progress; try again shortly.",
+                parent=self.top)
+            return
+        name = simpledialog.askstring(
+            "Add Pool Account",
+            "Account name (letters, numbers, - or _; not starting with _):",
+            parent=self.top)
+        if name is None or not name.strip():
+            return
+        name = name.strip()
+        if not messagebox.askyesno(
+            "Add Pool Account",
+            f"Add pool account '{name}'?\n\n"
+            "A terminal opens with an isolated login. Log in with the account "
+            "to add; closing the terminal cancels. If no login prompt appears, "
+            "type /login.",
+            parent=self.top):
+            return
+        self.app._start_pool_add(name)
+
+    def _on_remove(self):
+        name = self._selected_name()
+        if not name:
+            return
+        if not messagebox.askyesno(
+            "Remove Pool Account",
+            f"Remove pool account '{name}'?\n\n"
+            "Its login is parked recoverably under pool\\_retired-* — never "
+            "deleted.",
+            parent=self.top):
+            return
+        try:
+            _cli_backend().pool_retire(name)
+            self.app._set_status(f"Removed pool account '{name}' (recoverable).")
+        except Exception as error:
+            messagebox.showwarning(
+                "Remove Failed", str(error) or type(error).__name__, parent=self.top)
+        self._reload()
+
+    def _move(self, delta):
+        name = self._selected_name()
+        if not name:
+            return
+        try:
+            _cli_backend().pool_move(name, delta)
+        except Exception as error:
+            messagebox.showwarning(
+                "Move Failed", str(error) or type(error).__name__, parent=self.top)
+            return
+        self._reload()
+        self._select(name)
+
+    def _on_install(self):
+        try:
+            path = _cli_backend().pool_install_launcher()
+        except Exception as error:
+            messagebox.showwarning(
+                "Install Failed", str(error) or type(error).__name__, parent=self.top)
+            return
+        messagebox.showinfo(
+            "Launcher Installed",
+            f"Installed the pool launcher:\n{path}\n\n"
+            "With that folder on PATH, run e.g.:\n"
+            'claude-pool -p "..." --model claude-opus-4-8 ...',
+            parent=self.top)
 
 
 # ---------------------------------------------------------------------------

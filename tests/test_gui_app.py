@@ -354,6 +354,22 @@ class GuiContractTests(unittest.TestCase):
         cli.unpair.assert_called_once_with("alpha", sign_out_live=True)
         self.assertEqual("cli_unpair_ok", app._q.get_nowait()[0])
 
+    def test_pool_add_runs_on_worker_and_enqueues_backend_result(self) -> None:
+        app = self.make_app()
+        cli = Mock()
+        cli.pool_add.return_value = SimpleNamespace(
+            ok=True, name="work", cancelled=False, timed_out=False,
+            email="w@example.invalid", message="Added pool account 'work'.")
+
+        with patch.object(app_module, "_cli_backend", return_value=cli), patch.object(
+            app_module.threading, "Thread", ImmediateThread
+        ):
+            app._start_pool_add("work")
+
+        cli.pool_add.assert_called_once_with("work")
+        self.assertEqual(("pool_add_ok", cli.pool_add.return_value), app._q.get_nowait())
+        self.assertTrue(app._busy)  # cleared only by the queue handler, never the worker
+
 
 if __name__ == "__main__":
     unittest.main()
