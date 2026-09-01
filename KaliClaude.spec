@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('app.ico', '.')]
 binaries = []
-hiddenimports = ['desktop_backend']  # gui/app.py entry-script fallback
+hiddenimports = ['desktop_backend', 'cli_backend']  # gui/app.py entry-script fallback
 tmp_ret = collect_all('cryptography')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
