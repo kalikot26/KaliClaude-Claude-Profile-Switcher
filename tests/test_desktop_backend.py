@@ -154,6 +154,22 @@ class IsolatedDesktopTests(unittest.TestCase):
             launch_timeout=0.02,
             launch_poll_interval=0,
         )
+        # Hermetic seal: _launch_root copies dict(os.environ) into the
+        # environment it hands the (fake) process, so recorded launches would
+        # otherwise carry real machine vars (e.g. Windows sets
+        # FPS_BROWSER_APP_PROFILE_STRING='Internet Explorer', which trips the
+        # "explorer" fallback assertion). Replace the environment with a fixed,
+        # deterministic set so no real machine state can influence any test in
+        # this class. Keep a sentinel home so DesktopBackend.__init__'s
+        # Path.home()/APPDATA reads resolve (their results are discarded because
+        # every backend here is given explicit claude_dir/cache_dir).
+        env_patch = patch.dict(
+            "os.environ",
+            {"USERPROFILE": r"C:\hermetic-home", "HOME": "/hermetic-home"},
+            clear=True,
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
