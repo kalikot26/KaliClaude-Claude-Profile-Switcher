@@ -16,6 +16,7 @@ Desktop switch.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -34,6 +35,74 @@ except ImportError:  # pragma: no cover - exercised only in the frozen build
 CREDS_NAME = ".credentials.json"
 ACCOUNT_NAME = "account.json"
 CREATE_NEW_CONSOLE = 0x00000010
+
+# ----- CLI pool (v1: multiple simultaneously-logged-in CLI accounts) --------
+# Each pool account is a private CLAUDE_CONFIG_DIR home; the CLI relocates its
+# whole credential store there, so accounts run side-by-side with zero conflict.
+POOL_DIRNAME = "pool"
+POOL_ORDER_NAME = "pool.json"
+CLAUDE_CONFIG_DIR = "CLAUDE_CONFIG_DIR"
+RETIRED_PREFIX = "_retired-"
+LAUNCHER_PS1_NAME = "claude-pool.ps1"
+LAUNCHER_CMD_NAME = "claude-pool.cmd"
+# First char must be alphanumeric, so a name can never start with '_' — the
+# '_retired-*' namespace stays reserved for parked accounts.
+_POOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+# The launcher failover pattern, shared verbatim by the ps1 below. Kept as a
+# named constant so a test can pin exactly what the CLI output is scanned for.
+_LIMIT_REGEX = r"(?i)(usage|rate).{0,20}limit|limit (reached|hit)|out of (usage|quota)|\b429\b"
+
+# Self-contained PowerShell launcher — no python dependency. @@POOLJSON@@ is
+# replaced with the absolute pool.json path at install time.
+_LAUNCHER_PS1 = r"""# claude-pool.ps1 — run claude across a pool of isolated CLI logins.
+# For each account in pool.json order, point CLAUDE_CONFIG_DIR at its private
+# home and run claude with all args passed through. If the output looks like a
+# usage/rate limit, fail over to the next account; otherwise return as-is.
+$ErrorActionPreference = 'Stop'
+$PoolJson = '@@POOLJSON@@'
+$LimitRe = '""" + _LIMIT_REGEX + r"""'
+
+# Resolve claude.exe: same-dir first, else PATH.
+$Claude = Join-Path $PSScriptRoot 'claude.exe'
+if (-not (Test-Path -LiteralPath $Claude)) {
+    $found = Get-Command 'claude.exe' -ErrorAction SilentlyContinue
+    if ($found) { $Claude = $found.Source } else { $Claude = 'claude.exe' }
+}
+
+$accounts = @()
+if (Test-Path -LiteralPath $PoolJson) {
+    try {
+        $data = Get-Content -Raw -LiteralPath $PoolJson | ConvertFrom-Json
+        if ($data.order) { $accounts = @($data.order) }
+    } catch { }
+}
+if ($accounts.Count -eq 0) {
+    [Console]::Error.WriteLine("claude-pool: no pool accounts configured")
+    exit 1
+}
+
+$poolRoot = Split-Path -Parent $PoolJson
+$lastOutput = ''
+$lastCode = 0
+foreach ($name in $accounts) {
+    $env:CLAUDE_CONFIG_DIR = Join-Path $poolRoot $name
+    $lastOutput = (& $Claude @args 2>&1 | Out-String)
+    $lastCode = $LASTEXITCODE
+    if ($lastOutput -match $LimitRe) {
+        [Console]::Error.WriteLine("claude-pool: '$name' limit hit, failing over")
+        continue
+    }
+    [Console]::Error.WriteLine("claude-pool: served by '$name'")
+    [Console]::Out.Write($lastOutput)
+    exit $lastCode
+}
+[Console]::Error.WriteLine("claude-pool: all accounts exhausted")
+[Console]::Out.Write($lastOutput)
+exit $lastCode
+"""
+
+_LAUNCHER_CMD = '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0claude-pool.ps1" %*\r\n'
 
 # Env vars the CLI honours ahead of the credentials file. If any is set, a file
 # swap may not change the billed account — detect and warn only.
@@ -87,6 +156,24 @@ class CliUnpairResult:
     profile: str
     parked_store: str = ""
     parked_live: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class PoolAccount:
+    name: str
+    logged_in: bool
+    email: str = ""
+    account_uuid: str = ""
+
+
+@dataclass(frozen=True)
+class PoolAddResult:
+    ok: bool
+    name: str
+    cancelled: bool = False
+    timed_out: bool = False
+    email: str = ""
     message: str = ""
 
 
@@ -144,10 +231,10 @@ def _read_registry_env() -> dict[str, str]:
     return found
 
 
-def _default_spawner(argv: list[str]) -> Any:
+def _default_spawner(argv: list[str], env: dict[str, str]) -> Any:
     import subprocess
 
-    return subprocess.Popen(argv, creationflags=CREATE_NEW_CONSOLE)
+    return subprocess.Popen(argv, env=env, creationflags=CREATE_NEW_CONSOLE)
 
 
 class CliBackend:
@@ -158,7 +245,7 @@ class CliBackend:
         *,
         home: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
-        spawner: Optional[Callable[[list[str]], Any]] = None,
+        spawner: Optional[Callable[[list[str], dict[str, str]], Any]] = None,
         env_reader: Optional[Callable[[], dict[str, str]]] = None,
         which: Optional[Callable[[str], Optional[str]]] = None,
         pair_timeout: float = 600.0,
@@ -168,6 +255,7 @@ class CliBackend:
         self.home = home
         self.cache_dir = Path(cache_dir) if cache_dir else home / ".kalikot-claude-switcher"
         self.cli_data_dir = self.cache_dir / "cli-data"
+        self.pool_dir = self.cli_data_dir / POOL_DIRNAME
         self.live_creds = home / ".claude" / CREDS_NAME
         self.claude_json = home / ".claude.json"
         self._spawner = spawner or _default_spawner
@@ -332,7 +420,9 @@ class CliBackend:
                 message="Adopted the current CLI login for this profile.")
 
         executable = self.resolve_cli()
-        process = self._spawner(["cmd.exe", "/k", str(executable)])
+        # Partner-model pairing runs against the live store, so the child just
+        # inherits the current environment (no CLAUDE_CONFIG_DIR relocation).
+        process = self._spawner(["cmd.exe", "/k", str(executable)], dict(os.environ))
         deadline = time.monotonic() + self._pair_timeout
         while time.monotonic() < deadline:
             if self.live_creds.is_file():
@@ -408,6 +498,142 @@ class CliBackend:
         source.rename(destination)
         return destination
 
+    # ----- CLI pool ---------------------------------------------------------
+    # Each account is its own CLAUDE_CONFIG_DIR home under cli-data\pool\<name>;
+    # pool.json records the run order. The shared ~\.claude.json is harvested
+    # read-only (the just-completed login is its last writer) and never written.
+
+    def _pool_order(self) -> list[str]:
+        order = _load_json(self.pool_dir / POOL_ORDER_NAME).get("order")
+        if not isinstance(order, list):
+            return []
+        return [str(name) for name in order if isinstance(name, str)]
+
+    def _write_pool_order(self, order: list[str]) -> None:
+        _atomic_json(self.pool_dir / POOL_ORDER_NAME, {"order": order})
+
+    def _validate_pool_name(self, name: str) -> None:
+        if not isinstance(name, str) or not _POOL_NAME_RE.match(name):
+            raise CliBackendError(
+                f"Invalid pool account name '{name}'. Use 1–64 characters: "
+                "letters, numbers, '-' or '_', and it may not start with '_'.")
+
+    def _pool_account(self, name: str) -> PoolAccount:
+        account_dir = self.pool_dir / name
+        account = self._read_account(account_dir)
+        return PoolAccount(
+            name=name,
+            logged_in=(account_dir / CREDS_NAME).is_file(),
+            email=account.email,
+            account_uuid=account.account_uuid,
+        )
+
+    def pool_list(self) -> list[PoolAccount]:
+        """Accounts in pool.json order, with on-disk strays appended.
+
+        Excludes the reserved ``_retired-*`` namespace from both.
+        """
+        seen: set[str] = set()
+        names: list[str] = []
+        for name in self._pool_order():
+            if name in seen or name.startswith(RETIRED_PREFIX):
+                continue
+            seen.add(name)
+            names.append(name)
+        if self.pool_dir.is_dir():
+            for entry in sorted(self.pool_dir.iterdir(), key=lambda p: p.name):
+                if (entry.is_dir() and entry.name not in seen
+                        and not entry.name.startswith(RETIRED_PREFIX)):
+                    seen.add(entry.name)
+                    names.append(entry.name)
+        return [self._pool_account(name) for name in names]
+
+    def pool_add(self, name: str) -> PoolAddResult:
+        """Spawn a visible, isolated login terminal and adopt the new account.
+
+        The human does the OAuth login — this never automates it. The child is
+        given a private ``CLAUDE_CONFIG_DIR`` so the login writes only there.
+        Polls for that store's credentials file until it appears (adopt), the
+        terminal closes (cancel), or the timeout elapses.
+        """
+        self._validate_pool_name(name)
+        if name in self._pool_order():
+            raise CliBackendError(f"A pool account named '{name}' already exists.")
+
+        account_dir = self.pool_dir / name
+        account_dir.mkdir(parents=True, exist_ok=True)
+        creds = account_dir / CREDS_NAME
+        executable = self.resolve_cli()
+
+        env = dict(os.environ)
+        env[CLAUDE_CONFIG_DIR] = str(account_dir)
+        process = self._spawner(["cmd.exe", "/k", str(executable)], env)
+
+        deadline = time.monotonic() + self._pair_timeout
+        while time.monotonic() < deadline:
+            if creds.is_file():
+                # Best-effort identity: the just-completed login is the last
+                # writer of the shared ~\.claude.json oauthAccount.
+                account = self._harvest_account()
+                self._write_account(account_dir, account)
+                order = self._pool_order()
+                if name not in order:
+                    order.append(name)
+                    self._write_pool_order(order)
+                return PoolAddResult(
+                    ok=True, name=name, email=account.email,
+                    message=f"Added pool account '{name}'.")
+            if process.poll() is not None:
+                # ponytail: the empty pool\<name> dir is left behind (recoverable,
+                # never deleted); Remove parks it, or re-add after removing it.
+                return PoolAddResult(
+                    ok=False, name=name, cancelled=True,
+                    message="The login terminal closed before a login completed.")
+            time.sleep(self._pair_interval)
+
+        return PoolAddResult(
+            ok=False, name=name, timed_out=True,
+            message="Timed out waiting for a CLI login.")
+
+    def pool_retire(self, name: str) -> Optional[Path]:
+        """Park ``pool\\<name>`` as ``pool\\_retired-<stamp>-<name>`` and drop it
+        from the order. Recoverable dir move, never a delete; None-safe."""
+        order = self._pool_order()
+        if name in order:
+            self._write_pool_order([other for other in order if other != name])
+        source = self.pool_dir / name
+        if not source.is_dir():
+            return None
+        destination = self.pool_dir / f"{RETIRED_PREFIX}{_stamp()}-{name}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(destination)
+        return destination
+
+    def pool_move(self, name: str, delta: int) -> list[str]:
+        """Reorder ``name`` by ``delta`` within pool.json, clamped at the ends."""
+        order = self._pool_order()
+        if name not in order:
+            return order
+        index = order.index(name)
+        target = max(0, min(len(order) - 1, index + delta))
+        if target != index:
+            order.insert(target, order.pop(index))
+            self._write_pool_order(order)
+        return order
+
+    def pool_install_launcher(self) -> Path:
+        """Write the two self-contained launcher files into ~\\.local\\bin.
+
+        Returns the ps1 path. Overwrites any existing launcher.
+        """
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        ps1 = bin_dir / LAUNCHER_PS1_NAME
+        pool_json = str(self.pool_dir / POOL_ORDER_NAME)
+        ps1.write_text(_LAUNCHER_PS1.replace("@@POOLJSON@@", pool_json), encoding="utf-8")
+        (bin_dir / LAUNCHER_CMD_NAME).write_text(_LAUNCHER_CMD, encoding="utf-8")
+        return ps1
+
 
 _default_cli_backend: Optional[CliBackend] = None
 
@@ -453,3 +679,23 @@ def rename_store(old: str, new: str) -> Optional[Path]:
 
 def retire_store(name: str) -> Optional[Path]:
     return _default().retire_store(name)
+
+
+def pool_list() -> list[PoolAccount]:
+    return _default().pool_list()
+
+
+def pool_add(name: str) -> PoolAddResult:
+    return _default().pool_add(name)
+
+
+def pool_retire(name: str) -> Optional[Path]:
+    return _default().pool_retire(name)
+
+
+def pool_move(name: str, delta: int) -> list[str]:
+    return _default().pool_move(name, delta)
+
+
+def pool_install_launcher() -> Path:
+    return _default().pool_install_launcher()
