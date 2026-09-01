@@ -287,6 +287,73 @@ class GuiContractTests(unittest.TestCase):
         app._pump()
         app.root.after.assert_called_once_with(150, app._pump)
 
+    def switch_pair(self):
+        return [
+            app_module.Profile("alpha", "A", "", 1.0, "h", True, True, state=ProfileState.ACTIVE),
+            app_module.Profile("beta", "B", "", 1.0, "h", False, True, state=ProfileState.READY),
+        ]
+
+    def test_switch_enqueues_desktop_then_cli_partner(self) -> None:
+        app = self.make_app()
+        app._profiles = self.switch_pair()
+        app._sel = 1
+        desktop = Mock()
+        desktop.switch.return_value = SwitchResult(True, "beta")
+        cli = Mock()
+        cli.switch_to.return_value = SimpleNamespace(
+            ok=True, target="beta", needs_login=False, warnings=())
+
+        with patch.object(app_module, "_desktop_backend", return_value=desktop), patch.object(
+            app_module, "_cli_backend", return_value=cli
+        ), patch.object(app_module.messagebox, "askyesno", return_value=True), patch.object(
+            app_module.threading, "Thread", ImmediateThread
+        ):
+            app._on_switch()
+
+        self.assertEqual("switch_ok", app._q.get_nowait()[0])
+        self.assertEqual("cli_switch", app._q.get_nowait()[0])
+        cli.switch_to.assert_called_once_with("beta", "alpha")
+
+    def test_cli_partner_failure_never_touches_desktop_switch(self) -> None:
+        app = self.make_app()
+        app._profiles = self.switch_pair()
+        app._sel = 1
+        desktop = Mock()
+        desktop.switch.return_value = SwitchResult(True, "beta")
+        cli = Mock()
+        cli.switch_to.side_effect = RuntimeError("cli boom")
+
+        with patch.object(app_module, "_desktop_backend", return_value=desktop), patch.object(
+            app_module, "_cli_backend", return_value=cli
+        ), patch.object(app_module.messagebox, "askyesno", return_value=True), patch.object(
+            app_module.threading, "Thread", ImmediateThread
+        ):
+            app._on_switch()
+
+        self.assertEqual(("switch_ok", desktop.switch.return_value), app._q.get_nowait())
+        self.assertEqual(("cli_switch", "cli boom"), app._q.get_nowait())
+        desktop.stop_desktop.assert_not_called()
+        self.assertTrue(app._q.empty())
+
+    def test_unpair_handler_signs_out_active_profile_and_enqueues_ok(self) -> None:
+        app = self.make_app()
+        app._profiles = [app_module.Profile(
+            "alpha", "A", "", 1.0, "h", True, True,
+            state=ProfileState.ACTIVE, cli_paired=True)]
+        app._sel = 0
+        cli = Mock()
+        cli.unpair.return_value = SimpleNamespace(
+            ok=True, profile="alpha", parked_store="_unclaimed-x",
+            parked_live="_unclaimed-live", message="Unpaired 'alpha'.")
+
+        with patch.object(app_module, "_cli_backend", return_value=cli), patch.object(
+            app_module.messagebox, "askyesno", return_value=True
+        ), patch.object(app_module.threading, "Thread", ImmediateThread):
+            app._on_unpair_cli()
+
+        cli.unpair.assert_called_once_with("alpha", sign_out_live=True)
+        self.assertEqual("cli_unpair_ok", app._q.get_nowait()[0])
+
 
 if __name__ == "__main__":
     unittest.main()
