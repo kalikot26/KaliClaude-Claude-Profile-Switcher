@@ -272,10 +272,29 @@ class CliBackend:
     def _unclaimed_name(self, suffix: str = "") -> str:
         return f"_unclaimed-{_stamp()}" + (f"-{suffix}" if suffix else "")
 
-    def _harvest_account(self) -> CliAccount:
-        """Read-only harvest of oauthAccount from ~\\.claude.json (best-effort)."""
-        oauth = _load_json(self.claude_json).get("oauthAccount")
-        if not isinstance(oauth, dict):
+    def _harvest_account(self, config_dir: Optional[Path] = None) -> CliAccount:
+        """Read-only harvest of oauthAccount (best-effort); never writes any file.
+
+        A pool login runs under an isolated CLAUDE_CONFIG_DIR, where the current
+        CLI writes the true oauthAccount into that dir's OWN ``.claude.json``
+        while the shared ``~\\.claude.json`` stays stale. So for a pool slot
+        (``config_dir`` given) prefer that dir's own ``.claude.json`` when it
+        carries an identity, and fall back to the shared file. Default
+        ``config_dir=None`` is shared-only — correct for the live-default
+        ``~\\.claude`` plane (capture_live / switch_to / unpair).
+        """
+        def _oauth(path: Path) -> Optional[dict]:
+            oauth = _load_json(path).get("oauthAccount")
+            return oauth if isinstance(oauth, dict) else None
+
+        oauth = None
+        if config_dir is not None:
+            local = _oauth(Path(config_dir) / ".claude.json")
+            if local and (local.get("accountUuid") or local.get("emailAddress")):
+                oauth = local
+        if oauth is None:
+            oauth = _oauth(self.claude_json)
+        if oauth is None:
             return CliAccount()
         return CliAccount(
             account_uuid=str(oauth.get("accountUuid") or ""),
@@ -342,6 +361,7 @@ class CliBackend:
             raise CliBackendError("No live CLI credentials to capture.")
         store = self._store_dir(profile)
         _copy_file(self.live_creds, store / CREDS_NAME)
+        # Live plane: harvest the shared ~\.claude.json (its login's writer here).
         account = self._harvest_account()
         self._write_account(store, account)
         return account
@@ -357,6 +377,7 @@ class CliBackend:
         captured_outgoing = ""
 
         if self.live_creds.is_file():
+            # Live plane: shared ~\.claude.json is the source (no pool dir here).
             live = self._harvest_account()
             destination = outgoing
             if not outgoing:
@@ -457,7 +478,8 @@ class CliBackend:
             parked_live = self._unclaimed_name("live")
             store = self._store_dir(parked_live)
             _move_file(self.live_creds, store / CREDS_NAME)
-            self._write_account(store, self._harvest_account())  # best-effort
+            # Live plane: shared ~\.claude.json is the source (best-effort).
+            self._write_account(store, self._harvest_account())
 
         if parked_store is None and not parked_live:
             return CliUnpairResult(
@@ -500,8 +522,10 @@ class CliBackend:
 
     # ----- CLI pool ---------------------------------------------------------
     # Each account is its own CLAUDE_CONFIG_DIR home under cli-data\pool\<name>;
-    # pool.json records the run order. The shared ~\.claude.json is harvested
-    # read-only (the just-completed login is its last writer) and never written.
+    # pool.json records the run order. Identity is harvested read-only from the
+    # pool account's OWN config-dir .claude.json (the true writer of a login run
+    # under an isolated CLAUDE_CONFIG_DIR), falling back to the shared
+    # ~\.claude.json; neither file is ever written.
 
     def _pool_order(self) -> list[str]:
         order = _load_json(self.pool_dir / POOL_ORDER_NAME).get("order")
@@ -572,9 +596,9 @@ class CliBackend:
         deadline = time.monotonic() + self._pair_timeout
         while time.monotonic() < deadline:
             if creds.is_file():
-                # Best-effort identity: the just-completed login is the last
-                # writer of the shared ~\.claude.json oauthAccount.
-                account = self._harvest_account()
+                # Prefer the pool dir's own .claude.json (a CLAUDE_CONFIG_DIR
+                # login's true writer); fall back to the shared ~\.claude.json.
+                account = self._harvest_account(account_dir)
                 self._write_account(account_dir, account)
                 order = self._pool_order()
                 if name not in order:

@@ -22,11 +22,16 @@ class FakeSpawner:
     writes the live credentials file / reports the process as exited.
     """
 
-    def __init__(self, live_creds: Path, *, create_on=None, exit_on=None, payload=b"NEWCLI"):
+    def __init__(self, live_creds: Path, *, create_on=None, exit_on=None,
+                 payload=b"NEWCLI", local_oauth=None):
         self.live_creds = live_creds
         self.create_on = create_on
         self.exit_on = exit_on
         self.payload = payload
+        # When set, a pool login (isolated CLAUDE_CONFIG_DIR) also writes that
+        # dir's own .claude.json — as the current CLI does — carrying the true
+        # oauthAccount while the shared ~\.claude.json stays stale.
+        self.local_oauth = local_oauth
         self.polls = 0
         self.argv = None
         self.env = None
@@ -49,6 +54,9 @@ class FakeSpawner:
             target = self._target()
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(self.payload)
+            if self.local_oauth is not None and self.env and self.env.get("CLAUDE_CONFIG_DIR"):
+                (Path(self.env["CLAUDE_CONFIG_DIR"]) / ".claude.json").write_text(
+                    json.dumps({"oauthAccount": self.local_oauth}))
         if self.exit_on is not None and self.polls >= self.exit_on:
             return 0
         return None
@@ -350,6 +358,8 @@ class CliBackendTests(unittest.TestCase):
         return json.loads(self.pool("pool.json").read_text())["order"]
 
     def test_pool_add_harvests_identity_and_appends_order(self) -> None:
+        # No config-dir-local .claude.json here (spawner writes only creds), so
+        # harvest falls back to the shared ~\.claude.json — the (b) fallback path.
         self.write_claude_json(uuid="POOL-UUID", email="pool@example.invalid")
         spawner = FakeSpawner(self.home / ".claude" / CREDS, create_on=1, payload=b"POOL-CREDS")
         backend = self.make(spawner=spawner, which=lambda name: "C:/fake/claude.exe")
@@ -366,6 +376,33 @@ class CliBackendTests(unittest.TestCase):
         self.assertTrue(account.logged_in)
         self.assertEqual("pool@example.invalid", account.email)
         self.assertEqual("POOL-UUID", account.account_uuid)
+        self.assert_no_tmp()
+
+    def test_pool_add_prefers_config_dir_local_identity_over_stale_shared(self) -> None:
+        # (a) The shared ~\.claude.json is stale (a previously-logged-in account);
+        # the pool login writes its TRUE identity into the config dir's own
+        # .claude.json. Harvest must take the local identity, not the stale shared.
+        self.write_claude_json(uuid="STALE-UUID", email="stale@example.invalid")
+        spawner = FakeSpawner(
+            self.home / ".claude" / CREDS, create_on=1, payload=b"POOL-CREDS",
+            local_oauth={"accountUuid": "FRESH-UUID", "emailAddress": "fresh@example.invalid"})
+        backend = self.make(spawner=spawner, which=lambda name: "C:/fake/claude.exe")
+
+        result = backend.pool_add("work")
+
+        self.assertTrue(result.ok)
+        self.assertEqual("fresh@example.invalid", result.email)
+        account = backend.pool_list()[0]
+        self.assertEqual("fresh@example.invalid", account.email)
+        self.assertEqual("FRESH-UUID", account.account_uuid)
+        # Read-only: the shared file was never rewritten and stays stale.
+        self.assertEqual(
+            "stale@example.invalid",
+            json.loads((self.home / ".claude.json").read_text())["oauthAccount"]["emailAddress"])
+        # Read-only: the pool dir's own .claude.json is untouched too.
+        self.assertEqual(
+            "fresh@example.invalid",
+            json.loads((self.pool("work") / ".claude.json").read_text())["oauthAccount"]["emailAddress"])
         self.assert_no_tmp()
 
     def test_pool_add_refuses_duplicate(self) -> None:
