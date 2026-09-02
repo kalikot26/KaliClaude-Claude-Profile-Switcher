@@ -503,6 +503,9 @@ class CliBackendTests(unittest.TestCase):
         self.assertIn("all accounts exhausted", ps1_text)
         self.assertIn(r"\b429\b", ps1_text)                  # limit-regex fragment
         self.assertIn("CLAUDE_CONFIG_DIR", ps1_text)
+        self.assertIn("$null | & $Claude", ps1_text)         # stdin closed on native call
+        self.assertIn("$ErrorActionPreference = 'Continue'", ps1_text)  # native-stderr wrap
+        self.assertIn("$ErrorActionPreference = $eap", ps1_text)        # preference restored
         self.assertIn(str(self.pool("pool.json")), ps1_text)  # concrete pool path injected
         self.assertIn("claude-pool.ps1", cmd.read_text(encoding="utf-8"))
 
