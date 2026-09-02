@@ -87,8 +87,10 @@ $lastOutput = ''
 $lastCode = 0
 foreach ($name in $accounts) {
     $env:CLAUDE_CONFIG_DIR = Join-Path $poolRoot $name
-    $lastOutput = (& $Claude @args 2>&1 | Out-String)
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $lastOutput = ($null | & $Claude @args 2>&1 | Out-String)
     $lastCode = $LASTEXITCODE
+    $ErrorActionPreference = $eap
     if ($lastOutput -match $LimitRe) {
         [Console]::Error.WriteLine("claude-pool: '$name' limit hit, failing over")
         continue
