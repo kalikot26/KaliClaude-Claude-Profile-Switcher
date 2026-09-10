@@ -1608,9 +1608,11 @@ class App:
                 details += "\n\n" + "\n".join(visible)
                 if len(issues) > len(visible):
                     details += f"\n... and {len(issues) - len(visible)} more issues."
-            if not data.folders:
+            if not data.ok:
+                title = "History Sync Needs Attention"
+            elif not data.folders:
                 title = "No Eligible Code Folders"
-            elif not data.ok or data.message:
+            elif data.message:
                 title = "History Sync Needs Attention"
             else:
                 title = "Local Code Cards Synced"

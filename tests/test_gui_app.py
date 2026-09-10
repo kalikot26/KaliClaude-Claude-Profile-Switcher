@@ -223,6 +223,16 @@ class GuiContractTests(unittest.TestCase):
         backend.stop_desktop.assert_not_called()
         backend.launch_active.assert_not_called()
 
+    def test_sync_failure_without_folders_preserves_failure_title_and_message(self):
+        app = self.make_app()
+        report = SyncReport(False, failed=1, message="fixture backend failure")
+        with patch.object(app_module.messagebox, "showwarning") as warning:
+            app._handle_result("sync_done", report)
+        warning.assert_called_once()
+        self.assertEqual("History Sync Needs Attention", warning.call_args.args[0])
+        self.assertIn("fixture backend failure", warning.call_args.args[1])
+        self.assertEqual("fixture backend failure", report.message)
+
     def test_sync_no_eligible_folders_is_not_reported_as_restored(self):
         app = self.make_app()
         with patch.object(app_module.messagebox, "showwarning") as warning:
