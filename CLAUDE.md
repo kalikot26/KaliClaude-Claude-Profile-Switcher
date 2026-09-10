@@ -77,20 +77,27 @@ Open **CLI Pool…** from the main window:
 
 ### Running through the pool
 
-With `%USERPROFILE%\.local\bin` on `PATH`:
+With `%USERPROFILE%\.local\bin` on `PATH` (the app never edits `PATH`):
 
 ```powershell
-claude-pool -p "summarize this repo" --model claude-opus-4-8
+claude-pool.cmd -p "summarize this repo" 2> pool.err
 ```
 
 Every argument is passed straight through to `claude`. The launcher resolves
-`claude.exe` from its own directory first, then `PATH`. For each account in
-`pool.json` order it sets `CLAUDE_CONFIG_DIR` to that account's home and runs the
-CLI. If the output matches the usage/rate-limit pattern it logs
-`claude-pool: '<name>' limit hit, failing over` to stderr and tries the next
-account; otherwise it logs `claude-pool: served by '<name>'`, writes the output
-to stdout, and exits with the CLI's exit code. If every account is exhausted it
-logs `claude-pool: all accounts exhausted` and returns the last output and code.
+`claude.exe` beside itself, then `claude.exe`/`claude` on `PATH`, and exits 127
+if it finds none — never a silent empty success. For each account in `pool.json`
+order it sets `CLAUDE_CONFIG_DIR` to that account's home and runs the CLI, then:
+
+- fails over only when the run did **not** complete *and* the tail of its output
+  matches the limit pattern — logging
+  `claude-pool: '<name>' limit hit before completing (exit N), failing over`;
+- otherwise logs `claude-pool: served by '<name>'`, writes the output to stdout,
+  and exits with the CLI's exit code.
+
+Exhausting every account logs `claude-pool: all accounts exhausted`. Routing is
+stderr-only; the exit code is the child's, so callers must never branch on it.
+`CLAUDE_CONFIG_DIR` is restored on every exit path, so invoking the `.ps1`
+directly cannot leave the caller's shell pinned to a pool account.
 
 The launcher is self-contained PowerShell with no Python dependency, so it keeps
 working when KaliClaude itself is not running.
@@ -98,16 +105,24 @@ working when KaliClaude itself is not running.
 **Use it for non-interactive runs.** The launcher feeds `$null` on stdin and
 buffers the child's combined output through `Out-String` so it can scan for a
 limit, which means `-p` / batch invocations work and an interactive REPL session
-does not. For interactive work, set `CLAUDE_CONFIG_DIR` to one pool directory
-yourself and run `claude` directly.
+does not. For interactive work, set `CLAUDE_CONFIG_DIR` to one pool directory in
+a child process and run `claude` directly.
+
+The full orchestration guide — main account delegating to pool workers, what not
+to delegate, how to pin one account — is [AGENT-SETUP.md](AGENT-SETUP.md).
 
 ### Programmatic access
 
 `gui/cli_backend.py` exposes module-level functions over a shared default
-backend: `pool_list()`, `pool_add(name)`, `pool_retire(name)`,
+backend: `pool_list()`, `pool_add(name)`, `pool_conflicts()`, `pool_retire(name)`,
 `pool_move(name, delta)`, `pool_install_launcher()`. `CliBackend` takes injected
 `home`, `spawner`, `env_reader`, and `which` boundaries, which is how the tests
 drive it without touching the real machine.
+
+`pool_conflicts()` returns `{name: reason}` for slots that add no capacity —
+a second slot on an account already in the pool, or a slot holding the live
+default login. Both are invisible in the dialog otherwise, since it shows only an
+email, and both turn failover into a walk straight to "all accounts exhausted".
 
 ## Constraints to respect when changing this code
 

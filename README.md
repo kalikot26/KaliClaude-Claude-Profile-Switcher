@@ -95,21 +95,35 @@ with automatic failover when one hits a usage limit.
 4. **Install Launcher** — writes `claude-pool.ps1` and `claude-pool.cmd` into
    `%USERPROFILE%\.local\bin`.
 
-With that folder on `PATH`, run the CLI through the pool:
+Add that folder to `PATH` yourself — KaliClaude never modifies `PATH` — then run
+the CLI through the pool:
 
 ```powershell
-claude-pool -p "summarize this repo" --model claude-opus-4-8
+claude-pool.cmd -p "summarize this repo" 2> pool.err
 ```
 
 All arguments pass straight through to `claude`. The launcher tries each account
-in order, reports which one served the request on stderr, and moves to the next
-when the output looks like a usage or rate limit. It is self-contained
+in order and reports on **stderr** which one served the request. Routing is never
+visible in the exit code, which is the child CLI's own. It is self-contained
 PowerShell and needs neither Python nor a running KaliClaude.
 
-Use `claude-pool` for non-interactive runs such as `-p`; it buffers the CLI's
-output so it can detect a limit, so an interactive session will not work through
+Failover is deliberately conservative: it triggers only when a run did **not**
+complete and the tail of its output matches the usage-limit pattern. A long,
+successful answer that merely discusses rate limiting or HTTP 429 is returned as
+the answer rather than burning the rest of the pool on the same prompt.
+
+Use the pool for non-interactive runs such as `-p`; the launcher closes stdin and
+buffers output so it can inspect it, so an interactive session cannot work through
 it. To work interactively in one pool account, set `CLAUDE_CONFIG_DIR` to that
-account's directory and run `claude` directly.
+account's directory in a child process and run `claude` directly.
+
+Give every slot a **different** Anthropic account. Two slots on one account are
+not redundancy — failover from a limited slot lands on the same exhausted quota —
+so the dialog flags a duplicated slot, and flags one holding your live default
+login.
+
+Agents driving the pool should read [AGENT-SETUP.md](AGENT-SETUP.md), which covers
+the orchestration pattern, what not to delegate, and how to pin one account.
 
 `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN` are
 read by the CLI ahead of the credentials file. KaliClaude warns when one is set,

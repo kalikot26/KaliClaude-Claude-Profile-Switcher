@@ -52,22 +52,44 @@ _POOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # The launcher failover pattern, shared verbatim by the ps1 below. Kept as a
 # named constant so a test can pin exactly what the CLI output is scanned for.
 _LIMIT_REGEX = r"(?i)(usage|rate).{0,20}limit|limit (reached|hit)|out of (usage|quota)|\b429\b"
+# The regex is matched against the TAIL only, and only for a short run. An
+# agent answer can legitimately contain "rate limit" or a bare 429 (ask it to
+# write retry/backoff code and it will), and matching the whole buffer made
+# every such answer fail over — burning the entire pool on one prompt and
+# discarding the first account's correct reply, which is never printed because
+# only the surviving account's buffer reaches stdout.
+# ponytail: length heuristic, because a real limit refusal is short and an
+# answer discussing limits is long. Replace both with an exact match once the
+# CLI's actual limit banner is pinned from a live run.
+_LIMIT_TAIL_CHARS = 4000
+_LIMIT_MAX_CHARS = 2000
 
 # Self-contained PowerShell launcher — no python dependency. @@POOLJSON@@ is
 # replaced with the absolute pool.json path at install time.
 _LAUNCHER_PS1 = r"""# claude-pool.ps1 — run claude across a pool of isolated CLI logins.
 # For each account in pool.json order, point CLAUDE_CONFIG_DIR at its private
-# home and run claude with all args passed through. If the output looks like a
-# usage/rate limit, fail over to the next account; otherwise return as-is.
+# home and run claude with all args passed through. Fail over to the next
+# account only when the run did NOT complete and the END of its output looks
+# like a usage limit; otherwise return the result as-is.
 $ErrorActionPreference = 'Stop'
 $PoolJson = '@@POOLJSON@@'
 $LimitRe = '""" + _LIMIT_REGEX + r"""'
+$LimitTail = """ + str(_LIMIT_TAIL_CHARS) + r"""
+$LimitMax = """ + str(_LIMIT_MAX_CHARS) + r"""
 
-# Resolve claude.exe: same-dir first, else PATH.
+# Resolve the CLI: same-dir claude.exe first, then PATH. Fail loudly when it is
+# missing — the old bare-string fallback let an unresolvable CLI return exit 0
+# with empty output, which reads to a caller as a successful empty answer.
 $Claude = Join-Path $PSScriptRoot 'claude.exe'
 if (-not (Test-Path -LiteralPath $Claude)) {
     $found = Get-Command 'claude.exe' -ErrorAction SilentlyContinue
-    if ($found) { $Claude = $found.Source } else { $Claude = 'claude.exe' }
+    if (-not $found) { $found = Get-Command 'claude' -ErrorAction SilentlyContinue }
+    if ($found) {
+        $Claude = $found.Source
+    } else {
+        [Console]::Error.WriteLine("claude-pool: could not find the Claude Code CLI (no claude.exe beside this script and none on PATH)")
+        exit 127
+    }
 }
 
 $accounts = @()
@@ -82,25 +104,46 @@ if ($accounts.Count -eq 0) {
     exit 1
 }
 
+# Running this .ps1 directly (rather than through claude-pool.cmd, which gets a
+# throwaway child process) would otherwise leave the caller's shell pinned to
+# whichever pool account we tried last.
+$CallerConfigDir = $env:CLAUDE_CONFIG_DIR
+function Restore-CallerConfigDir {
+    if ($null -eq $script:CallerConfigDir) {
+        Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:CLAUDE_CONFIG_DIR = $script:CallerConfigDir
+    }
+}
+
 $poolRoot = Split-Path -Parent $PoolJson
 $lastOutput = ''
 $lastCode = 0
 foreach ($name in $accounts) {
     $env:CLAUDE_CONFIG_DIR = Join-Path $poolRoot $name
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
     $lastOutput = ($null | & $Claude @args 2>&1 | Out-String)
     $lastCode = $LASTEXITCODE
     $ErrorActionPreference = $eap
-    if ($lastOutput -match $LimitRe) {
-        [Console]::Error.WriteLine("claude-pool: '$name' limit hit, failing over")
+
+    # Fail over ONLY when the run did not complete AND the limit text is near
+    # the end of a short output. A limit refusal is terse; an agent answer that
+    # merely discusses rate limits is long and exits 0.
+    $tail = if ($lastOutput.Length -gt $LimitTail) { $lastOutput.Substring($lastOutput.Length - $LimitTail) } else { $lastOutput }
+    $completed = ($lastCode -eq 0) -and ($lastOutput.Length -ge $LimitMax)
+    if ((-not $completed) -and ($tail -match $LimitRe)) {
+        [Console]::Error.WriteLine("claude-pool: '$name' limit hit before completing (exit $lastCode), failing over")
         continue
     }
     [Console]::Error.WriteLine("claude-pool: served by '$name'")
     [Console]::Out.Write($lastOutput)
+    Restore-CallerConfigDir
     exit $lastCode
 }
 [Console]::Error.WriteLine("claude-pool: all accounts exhausted")
 [Console]::Out.Write($lastOutput)
+Restore-CallerConfigDir
 exit $lastCode
 """
 
@@ -176,6 +219,7 @@ class PoolAddResult:
     cancelled: bool = False
     timed_out: bool = False
     email: str = ""
+    conflict: str = ""
     message: str = ""
 
 
@@ -574,6 +618,29 @@ class CliBackend:
                     names.append(entry.name)
         return [self._pool_account(name) for name in names]
 
+    def pool_conflicts(self) -> dict[str, str]:
+        """Pool account name -> why that slot adds no capacity.
+
+        Two slots on the same Anthropic account are not redundancy: failing over
+        from a limited slot lands on the same exhausted quota, and the launcher
+        then walks straight to "all accounts exhausted". A slot holding the live
+        default login is worse still — delegating to it bills the very account
+        the pool exists to spare. Neither is detectable from the dialog, which
+        shows only an email, so surface both by account UUID.
+        """
+        live = self._harvest_account().account_uuid
+        first_seen: dict[str, str] = {}
+        conflicts: dict[str, str] = {}
+        for account in self.pool_list():
+            if not account.account_uuid:
+                continue
+            owner = first_seen.setdefault(account.account_uuid, account.name)
+            if owner != account.name:
+                conflicts[account.name] = f"same account as pool slot '{owner}'"
+            if live and account.account_uuid == live:
+                conflicts[account.name] = "same account as the live default CLI login"
+        return conflicts
+
     def pool_add(self, name: str) -> PoolAddResult:
         """Spawn a visible, isolated login terminal and adopt the new account.
 
@@ -606,9 +673,18 @@ class CliBackend:
                 if name not in order:
                     order.append(name)
                     self._write_pool_order(order)
+                # Warn-only: the login is real and already stored, so refusing
+                # it here would strand it. Say so instead and let the user
+                # retire the slot.
+                conflict = self.pool_conflicts().get(name, "")
+                message = f"Added pool account '{name}'."
+                if conflict:
+                    message += (f" Warning: it is the {conflict}, so it adds no "
+                                "extra capacity — failover from a limited slot "
+                                "lands on the same quota.")
                 return PoolAddResult(
                     ok=True, name=name, email=account.email,
-                    message=f"Added pool account '{name}'.")
+                    conflict=conflict, message=message)
             if process.poll() is not None:
                 # ponytail: the empty pool\<name> dir is left behind (never
                 # deleted). It never entered the order, so re-adding the same
@@ -714,6 +790,10 @@ def pool_list() -> list[PoolAccount]:
 
 def pool_add(name: str) -> PoolAddResult:
     return _default().pool_add(name)
+
+
+def pool_conflicts() -> dict[str, str]:
+    return _default().pool_conflicts()
 
 
 def pool_retire(name: str) -> Optional[Path]:

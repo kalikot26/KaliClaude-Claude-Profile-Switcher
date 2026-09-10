@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gui.cli_backend import CliBackend, CliBackendError
+from gui.cli_backend import (
+    CliBackend,
+    CliBackendError,
+    _LIMIT_MAX_CHARS,
+    _LIMIT_REGEX,
+    _LIMIT_TAIL_CHARS,
+)
 from gui.desktop_backend import _sha256
 
 POOL = "pool"
@@ -508,6 +515,89 @@ class CliBackendTests(unittest.TestCase):
         self.assertIn("$ErrorActionPreference = $eap", ps1_text)        # preference restored
         self.assertIn(str(self.pool("pool.json")), ps1_text)  # concrete pool path injected
         self.assertIn("claude-pool.ps1", cmd.read_text(encoding="utf-8"))
+
+    def test_launcher_guards_failover_and_restores_caller_config_dir(self) -> None:
+        ps1_text = self.make().pool_install_launcher().read_text(encoding="utf-8")
+
+        # Failover is gated on BOTH "did not complete" and a tail-only match,
+        # so an answer that merely discusses rate limits cannot burn the pool.
+        self.assertIn("$completed = ($lastCode -eq 0)", ps1_text)
+        self.assertIn("(-not $completed) -and ($tail -match $LimitRe)", ps1_text)
+        self.assertIn(f"$LimitTail = {_LIMIT_TAIL_CHARS}", ps1_text)
+        self.assertIn(f"$LimitMax = {_LIMIT_MAX_CHARS}", ps1_text)
+        self.assertNotIn("if ($lastOutput -match $LimitRe)", ps1_text)  # old whole-buffer match
+        # A missing CLI fails loudly instead of returning exit 0 with no output.
+        self.assertIn("exit 127", ps1_text)
+        self.assertNotIn("$Claude = 'claude.exe'", ps1_text)  # old silent bare fallback
+        # Direct .ps1 invocation must not leave the caller's shell pinned.
+        self.assertIn("$CallerConfigDir = $env:CLAUDE_CONFIG_DIR", ps1_text)
+        # One definition plus a call on each of the two exit paths.
+        self.assertEqual(3, ps1_text.count("Restore-CallerConfigDir"))
+
+    def test_limit_rule_ignores_agent_prose_but_still_catches_a_refusal(self) -> None:
+        """Mirror of the launcher's decision, pinning the constants it uses."""
+        def fails_over(output: str, exit_code: int) -> bool:
+            tail = output[-_LIMIT_TAIL_CHARS:]
+            completed = exit_code == 0 and len(output) >= _LIMIT_MAX_CHARS
+            return not completed and re.search(_LIMIT_REGEX, tail) is not None
+
+        # The regression: a long, successful answer that talks about limits.
+        prose = "Add retry logic for HTTP 429 and rate limit handling. " * 60
+        self.assertGreater(len(prose), _LIMIT_MAX_CHARS)
+        self.assertIsNotNone(re.search(_LIMIT_REGEX, prose))  # still matches the regex
+        self.assertFalse(fails_over(prose, 0))                # but no longer fails over
+
+        # A real refusal is short and non-zero — failover must still happen.
+        self.assertTrue(fails_over("Usage limit reached. Try again later.", 1))
+        # Short and zero-exit still fails over: a terse limit banner may exit 0.
+        self.assertTrue(fails_over("5-hour limit reached", 0))
+        # An ordinary short answer with no limit text is served, not failed over.
+        self.assertFalse(fails_over("Done.", 0))
+
+    def test_pool_conflicts_flags_duplicate_slots_and_the_live_login(self) -> None:
+        self.write_claude_json(uuid="LIVE-UUID", email="main@example.invalid")
+        for name, uuid, email in (
+            ("worker", "WORKER-UUID", "worker@example.invalid"),
+            ("worker-again", "WORKER-UUID", "worker@example.invalid"),
+            ("ismain", "LIVE-UUID", "main@example.invalid"),
+            ("solo", "SOLO-UUID", "solo@example.invalid"),
+        ):
+            account_dir = self.pool(name)
+            account_dir.mkdir(parents=True, exist_ok=True)
+            (account_dir / CREDS).write_bytes(b"C")
+            (account_dir / "account.json").write_text(
+                json.dumps({"accountUuid": uuid, "emailAddress": email}))
+        self.pool("pool.json").write_text(json.dumps(
+            {"order": ["worker", "worker-again", "ismain", "solo"]}))
+
+        conflicts = self.make().pool_conflicts()
+
+        self.assertNotIn("worker", conflicts)   # the first slot on a UUID is fine
+        self.assertNotIn("solo", conflicts)
+        self.assertEqual("same account as pool slot 'worker'", conflicts["worker-again"])
+        self.assertEqual("same account as the live default CLI login", conflicts["ismain"])
+
+    def test_pool_add_warns_when_the_new_slot_duplicates_an_existing_one(self) -> None:
+        # The live default is a DIFFERENT account, so only the slot-vs-slot
+        # duplicate is in play here.
+        self.write_claude_json(uuid="LIVE-UUID", email="main@example.invalid")
+        existing = self.pool("first")
+        existing.mkdir(parents=True, exist_ok=True)
+        (existing / CREDS).write_bytes(b"C")
+        (existing / "account.json").write_text(
+            json.dumps({"accountUuid": "DUPE-UUID", "emailAddress": "dupe@example.invalid"}))
+        self.pool("pool.json").write_text(json.dumps({"order": ["first"]}))
+        spawner = FakeSpawner(
+            self.pool("second") / CREDS, create_on=1,
+            local_oauth={"accountUuid": "DUPE-UUID", "emailAddress": "dupe@example.invalid"})
+        backend = self.make(spawner=spawner, which=lambda name: "C:/fake/claude.exe")
+
+        result = backend.pool_add("second")
+
+        self.assertTrue(result.ok)                       # the login is kept, never stranded
+        self.assertEqual("same account as pool slot 'first'", result.conflict)
+        self.assertIn("adds no extra capacity", result.message)
+        self.assertEqual(["first", "second"], self.pool_order())
 
 
 if __name__ == "__main__":

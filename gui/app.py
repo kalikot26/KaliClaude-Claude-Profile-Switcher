@@ -2041,10 +2041,18 @@ class CliPoolDialog(_BaseDialog):
             self._accounts = []
             self.app._set_status(
                 f"CLI pool list failed: {str(error) or type(error).__name__}")
+        try:
+            conflicts = _cli_backend().pool_conflicts()
+        except Exception:
+            conflicts = {}
         self._list.delete(0, tk.END)
         for i, account in enumerate(self._accounts, start=1):
             label = account.email or "signed out"
-            self._list.insert(tk.END, f"{i}. {account.name} — {label}")
+            # Two slots on one account look like capacity and are not; say so
+            # on the row, because the email alone reads as cosmetic.
+            conflict = conflicts.get(account.name)
+            suffix = f"  ⚠ {conflict}" if conflict else ""
+            self._list.insert(tk.END, f"{i}. {account.name} — {label}{suffix}")
 
     def _selected_name(self):
         selection = self._list.curselection()
@@ -2124,8 +2132,13 @@ class CliPoolDialog(_BaseDialog):
         messagebox.showinfo(
             "Launcher Installed",
             f"Installed the pool launcher:\n{path}\n\n"
-            "With that folder on PATH, run e.g.:\n"
-            'claude-pool -p "..." --model claude-opus-4-8 ...',
+            f"Add {path.parent} to PATH, then call the .cmd — it runs the pool "
+            "in a throwaway child process, so CLAUDE_CONFIG_DIR never pins your "
+            "own shell:\n\n"
+            'claude-pool.cmd -p "<task>. Write the output to <file>. '
+            'Reply with one short line." 2> pool.err\n\n'
+            "Routing is reported on stderr ('served by', 'limit hit', "
+            "'all accounts exhausted'), never in the exit code.",
             parent=self.top)
 
 
