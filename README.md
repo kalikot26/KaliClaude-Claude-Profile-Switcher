@@ -21,6 +21,8 @@ credentials.
 - Managed launch/stop targets only a verified Claude Desktop installation and
   fails closed on unknown or unclassifiable `claude.exe` processes.
 - Manual usage refresh reads only the selected active root's cookie database.
+- **Pair CLI** attaches a Claude Code CLI login to a profile, and the **CLI pool**
+  keeps several CLI accounts signed in at once with usage-limit failover.
 - History sync is limited to isolated roots carrying the same account UUID;
   different accounts and the default root never share cards. Conversation JSONL
   files are never rewritten. Unsafe path segments are rejected, and deletion
@@ -64,6 +66,54 @@ important profile data.
 5. Use **Verify Login** when a profile shows **Needs validation**.
 6. A **Needs re-login** profile has preserved recovery material but no exact
    verified login that can be selected safely; prepare and save a fresh login.
+
+## Claude Code CLI
+
+The Claude Code CLI is a separate auth plane from Claude Desktop: it keeps a
+plaintext `%USERPROFILE%\.claude\.credentials.json`. KaliClaude manages it two
+ways, and a CLI failure never rolls back a Desktop switch.
+
+### Pair a CLI login to a profile
+
+**Pair CLI** attaches the current Claude Code login to the selected profile, so
+switching that profile also installs its stored CLI credentials. If no login is
+present, a terminal opens for you to sign in — KaliClaude never automates login.
+**Unpair CLI** detaches it again. Nothing is deleted: an outgoing login is parked
+under `cli-data\_unclaimed-*` and stays recoverable.
+
+### CLI pool — several accounts signed in at once
+
+**CLI Pool…** keeps multiple CLI accounts logged in side by side, each in its own
+`CLAUDE_CONFIG_DIR` under `cli-data\pool\<name>`, and runs them in a chosen order
+with automatic failover when one hits a usage limit.
+
+1. **Add Account** — name it, then complete the login in the terminal that opens.
+   If no login prompt appears, type `/login`. Closing the terminal cancels.
+   Names allow letters, numbers, `-` and `_`, and may not start with `_`.
+2. **Move Up** / **Move Down** — set failover priority; position 1 is tried first.
+3. **Remove** — parks the account under `pool\_retired-*`, never deletes it.
+4. **Install Launcher** — writes `claude-pool.ps1` and `claude-pool.cmd` into
+   `%USERPROFILE%\.local\bin`.
+
+With that folder on `PATH`, run the CLI through the pool:
+
+```powershell
+claude-pool -p "summarize this repo" --model claude-opus-4-8
+```
+
+All arguments pass straight through to `claude`. The launcher tries each account
+in order, reports which one served the request on stderr, and moves to the next
+when the output looks like a usage or rate limit. It is self-contained
+PowerShell and needs neither Python nor a running KaliClaude.
+
+Use `claude-pool` for non-interactive runs such as `-p`; it buffers the CLI's
+output so it can detect a limit, so an interactive session will not work through
+it. To work interactively in one pool account, set `CLAUDE_CONFIG_DIR` to that
+account's directory and run `claude` directly.
+
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN` are
+read by the CLI ahead of the credentials file. KaliClaude warns when one is set,
+because a switch may then not change the billed account.
 
 ## Migration and recovery
 
@@ -124,5 +174,6 @@ The live source launch created the pending isolated root, produced its own
 root; the login page opened without credentials. The packaged GUI was rebuilt
 after this fix.
 
-Claude Code account switching is outside Phase 1.1. Managed Claude Code and
-agent-mode history synchronization remains part of this release.
+Claude Code CLI support ships as a partner to the Desktop switch: per-profile
+pairing and the CLI pool, both described above. Managed Claude Code and
+agent-mode history synchronization remain part of this release.
