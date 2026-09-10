@@ -23,10 +23,17 @@ credentials.
 - Manual usage refresh reads only the selected active root's cookie database.
 - **Pair CLI** attaches a Claude Code CLI login to a profile, and the **CLI pool**
   keeps several CLI accounts signed in at once with usage-limit failover.
-- History sync is limited to isolated roots carrying the same account UUID;
-  different accounts and the default root never share cards. Conversation JSONL
-  files are never rewritten. Unsafe path segments are rejected, and deletion
-  does not touch a root whose Claude window is still running.
+- **Sync History** shares local Claude Code `local_*.json` cards across saved
+  accounts, only into each profile's own verified account/org directory.
+  Missing cards are added; embedded `lastActivityAt` determines newer copies,
+  never filesystem modification time. Unknown freshness or differing archive
+  state is preserved for review. Existing cards in running profiles are skipped.
+  Verified card-only backups precede writes; missing files never cause deletion.
+  Logins, the default root, cloud chats, groups and agent-mode state stay separate.
+  Conversation JSONL files are never read or changed. No sessions are stopped;
+  restart affected Claude windows yourself to load added cards, or close a profile
+  and sync again to apply its skipped updates. Ambiguous/missing account/org
+  folders are reported for verification rather than created from log text.
 
 ## Requirements and setup
 
@@ -142,7 +149,7 @@ quarantined or replaced.
 Data lives under `%USERPROFILE%\.kalikot-claude-switcher\`:
 
 - `desktop-data\<profile>` — isolated Claude Desktop roots
-- `backups\` — bounded operational and pre-deletion recovery backups
+- `backups\` — bounded operational backups and retained `cc-sync-*` card backups
 - `profiles\` — retained legacy schema-2 material used only for migration
 - `meta.json` — schema-3 profile selection and validation metadata
 
@@ -189,5 +196,5 @@ root; the login page opened without credentials. The packaged GUI was rebuilt
 after this fix.
 
 Claude Code CLI support ships as a partner to the Desktop switch: per-profile
-pairing and the CLI pool, both described above. Managed Claude Code and
-agent-mode history synchronization remain part of this release.
+pairing and the CLI pool, both described above. History sync shares only local
+Claude Code cards; it does not copy agent-mode state or CLI credentials.
