@@ -1313,17 +1313,18 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_sync_histories(self):
-        """Sync local history only between roots carrying the same account ID."""
+        """Share local Code cards while preserving each profile's login."""
         if not self._action_ready():
             return
         if not messagebox.askyesno(
             "Sync Claude Code History",
-            "Sync Claude Code + agent-mode sessions only between isolated roots "
-            "with the same account ID. Different accounts never share cards.\n\n"
-            "• Newest copy wins within one account; user-deleted conversations stay deleted.\n"
-            "• A local history backup is made before deletions propagate.\n"
-            "• The default Desktop root is never included.\n"
-            "• Conversation JSONL files are not rewritten.\n\n"
+            "Share local Claude Code cards across saved profiles, including different accounts.\n\n"
+            "• Each profile keeps its own login and verified account/org folder.\n"
+            "• Missing cards are added; newer activity can update existing cards in closed profiles.\n"
+            "• Backups precede writes. Missing files never trigger deletion; archive conflicts are skipped.\n"
+            "• Default-root data, cloud chats, groups, agent-mode state and CLI logins are excluded.\n"
+            "• Conversation JSONL files are never read or changed.\n\n"
+            "No sessions are closed. Restart affected Claude windows yourself when ready to load added cards.\n\n"
             "Continue?", parent=self.root):
             return
         self._busy = True
@@ -1332,12 +1333,7 @@ class App:
         def work():
             try:
                 report = _desktop_backend().sync_histories()
-                if not report.ok:
-                    raise RuntimeError(report.message or "History sync failed")
-                self._q.put(("sync_ok", {
-                    "added": report.added,
-                    "deleted": report.removed,
-                }))
+                self._q.put(("sync_done", report))
             except Exception as e:
                 self._q.put(("sync_err", str(e)))
 
@@ -1585,20 +1581,43 @@ class App:
             messagebox.showerror("Prepare Failed", data, parent=self.root)
             self._set_status(f"Prepare failed: {data}")
             self._refresh()
-        elif kind == "sync_ok":
+        elif kind == "sync_done":
             self._busy = False
-            added = (data or {}).get("added", 0)
-            removed = (data or {}).get("deleted", 0)
-            self._set_status(
-                f"Claude Code history synced — {added} added, {removed} removed.")
-            messagebox.showinfo(
-                "History Synced",
-                "Claude Code + agent-mode history is synced only within the "
-                "same account ID. Different profiles/accounts stay separate.\n\n"
-                f"• {added} session copies added\n"
-                f"• {removed} deleted conversations propagated\n\n"
-                "No default-root or cross-account cards were copied.",
-                parent=self.root)
+            summary = (
+                f"{data.added} added, {data.updated} updated, "
+                f"{data.skipped} skipped, {data.failed} failed."
+            )
+            self._set_status(f"Local Code card sync: {summary}")
+            details = (
+                f"{summary}\n{data.folders} verified profile folders; "
+                f"{data.profiles_skipped} profiles skipped; {data.conflicts} conflicting cards.\n\n"
+                "Skipped copies include unchanged cards, conflicts and updates in running profiles.\n"
+                "Logins remain separate. Cloud chats, groups and agent-mode state are excluded.\n"
+                "No sessions were closed. Restart affected Claude windows yourself when ready "
+                "to load added cards. Close running profiles and sync again for skipped updates."
+            )
+            if data.backup:
+                details += f"\n\nCard backup: {data.backup.path}"
+            if data.message:
+                issues = data.message.splitlines()
+                visible = []
+                for issue in issues[:5]:
+                    label, separator, reason = issue.partition(": ")
+                    concise = f"{Path(label).name}: {reason}" if separator else issue
+                    visible.append(concise if len(concise) <= 160 else concise[:157] + "...")
+                details += "\n\n" + "\n".join(visible)
+                if len(issues) > len(visible):
+                    details += f"\n... and {len(issues) - len(visible)} more issues."
+            if not data.ok:
+                title = "History Sync Needs Attention"
+            elif not data.folders:
+                title = "No Eligible Code Folders"
+            elif data.message:
+                title = "History Sync Needs Attention"
+            else:
+                title = "Local Code Cards Synced"
+            show = messagebox.showwarning if not data.ok or data.message or not data.folders else messagebox.showinfo
+            show(title, details, parent=self.root)
             self._refresh()
         elif kind == "sync_err":
             self._busy = False

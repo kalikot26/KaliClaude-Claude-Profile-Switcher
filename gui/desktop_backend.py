@@ -12,6 +12,7 @@ import base64
 import ctypes
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -22,6 +23,7 @@ import uuid
 import re
 from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Optional
@@ -31,9 +33,7 @@ MANIFEST_SCHEMA = 3
 OAUTH_KEY_V1 = "oauth:tokenCache"
 OAUTH_KEY_V2 = "oauth:tokenCacheV2"
 MAX_OPERATIONAL_BACKUPS = 5
-MAX_HISTORY_BACKUPS = 5
-CC_SESSION_ROOTS = ("claude-code-sessions", "local-agent-mode-sessions")
-JSONL_NAME = ".jsonl"
+CC_SESSION_ROOT = "claude-code-sessions"
 _USER_DATA_DIR_RE = re.compile(
     r"--user-data-dir(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|(\S+))",
     re.IGNORECASE,
@@ -113,6 +113,13 @@ class SyncReport:
     added: int = 0
     removed: int = 0
     message: str = ""
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    conflicts: int = 0
+    folders: int = 0
+    profiles_skipped: int = 0
+    backup: Optional[BackupRef] = None
 
 
 @dataclass(frozen=True)
@@ -907,18 +914,6 @@ class DesktopBackend:
     def _root_is_running(self, root: Path) -> bool:
         return bool(self._pids_for_root(root))
 
-    def _history_folder_is_live(self, folder: Path) -> bool:
-        for root, _account in self._managed_history_roots():
-            try:
-                resolved_root = root.resolve()
-                resolved_folder = folder.resolve()
-            except OSError:
-                continue
-            if resolved_folder == resolved_root or resolved_root in resolved_folder.parents:
-                if self._root_is_running(root):
-                    return True
-        return False
-
     def _stop_desktop(self) -> bool:
         return self._stop_root(self.active_user_data_dir(), allow_original=False)
 
@@ -1094,214 +1089,239 @@ class DesktopBackend:
 
     @staticmethod
     def _safe_history_segment(raw: str) -> str:
-        if re.search(r"%[0-9a-fA-F]{2}", raw):
-            raise SnapshotValidationError("History log contains an unsafe encoded path segment")
-        decoded = raw.strip()
         if (
-            not decoded
-            or decoded in {".", ".."}
-            or "/" in decoded
-            or "\\" in decoded
-            or ":" in decoded
-            or "\x00" in decoded
-            or Path(decoded).is_absolute()
-            or PureWindowsPath(decoded).is_absolute()
+            not raw or raw in {".", ".."} or raw != raw.strip()
+            or raw.endswith(".") or re.search(r"%[0-9a-fA-F]{2}", raw)
+            or any(ord(char) < 32 or char in '/\\:<>"|?*' for char in raw)
+            or Path(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
         ):
-            raise SnapshotValidationError("History log contains an unsafe path segment")
-        return decoded
+            raise SnapshotValidationError("History contains an unsafe path segment")
+        return raw
 
     @staticmethod
     def _contained_path(root: Path, *segments: str) -> Path:
-        resolved_root = root.resolve()
-        candidate = root.joinpath(*segments).resolve()
-        if candidate != resolved_root and resolved_root not in candidate.parents:
+        # Check links before resolving: resolve() alone hides junctions/symlinks.
+        candidate = root
+        for segment in (None, *segments):
+            if segment is not None:
+                candidate = candidate / DesktopBackend._safe_history_segment(segment)
+            try:
+                stat = candidate.lstat()
+                if candidate.is_symlink() or getattr(stat, "st_file_attributes", 0) & 0x400:
+                    raise SnapshotValidationError("History path contains a link or junction")
+            except FileNotFoundError:
+                pass
+        resolved_root, resolved = root.resolve(), candidate.resolve()
+        if resolved != resolved_root and resolved_root not in resolved.parents:
             raise SnapshotValidationError("History path escapes its managed root")
         return candidate
 
-    def _managed_history_roots(self) -> list[tuple[Path, str]]:
-        meta = self._load_meta()
-        managed: list[tuple[Path, str]] = []
-        seen: set[tuple[str, str]] = set()
+    @staticmethod
+    def _history_uuid(raw: Any) -> str:
+        if not isinstance(raw, str) or str(uuid.UUID(raw)) != raw.lower():
+            raise SnapshotValidationError("History identity must be a canonical account/org UUID")
+        return raw
 
-        def add(root: Path, account: str) -> None:
+    def _managed_history_targets(self) -> tuple[dict[Path, tuple[Path, str]], list[str]]:
+        targets: dict[Path, tuple[Path, str]] = {}
+        issues: list[str] = []
+        for name, entry in self._load_meta()["profiles"].items():
             try:
-                resolved = root.resolve()
-                safe_account = self._safe_history_segment(account)
-            except (OSError, SnapshotValidationError):
-                return
-            key = (_windows_path_key(resolved), safe_account)
-            if key in seen:
-                return
-            seen.add(key)
-            managed.append((resolved, safe_account))
-
-        for name, entry in meta.get("profiles", {}).items():
-            if not isinstance(name, str) or not isinstance(entry, dict) or not self._valid_name(name):
-                continue
-            root = self._root_for_entry(name, entry)
-            if not root.is_dir() or root.is_symlink():
-                continue
-            config = _load_json(root / "config.json")
-            account = config.get("lastKnownAccountUuid")
-            if not isinstance(account, str):
-                continue
-            add(root, account)
-        return managed
-
-    def _history_workspaces(self, root: Path, account: str) -> dict[str, set[str]]:
-        workspaces = {root_name: set() for root_name in CC_SESSION_ROOTS}
-        log = root / "Logs" / "main.log"
-        try:
-            lines = log.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            lines = []
-        for line in lines:
-            lower = line.lower()
-            if "persisted sessions from" not in lower and "does not exist yet" not in lower:
-                continue
-            for root_name in CC_SESSION_ROOTS:
-                position = lower.find(root_name.lower())
-                if position < 0:
-                    continue
-                tail = line[position + len(root_name):].lstrip("/\\")
-                segments = [segment for segment in re.split(r"[\\/]", tail) if segment]
-                if len(segments) >= 2:
-                    workspace = self._safe_history_segment(segments[0])
-                    logged_account = self._safe_history_segment(segments[1])
-                    if logged_account == account:
-                        workspaces[root_name].add(workspace)
-                break
-        for root_name in CC_SESSION_ROOTS:
-            history_root = self._contained_path(root, root_name)
-            if not history_root.is_dir() or history_root.is_symlink():
-                continue
-            for workspace_path in history_root.iterdir():
-                if not workspace_path.is_dir() or workspace_path.is_symlink():
-                    continue
-                workspace = self._safe_history_segment(workspace_path.name)
-                account_path = self._contained_path(history_root, workspace, account)
-                if account_path.is_dir() and not account_path.is_symlink():
-                    workspaces[root_name].add(workspace)
-        return workspaces
-
-    def _managed_history_targets(self) -> dict[str, list[tuple[Path, str]]]:
-        roots = self._managed_history_roots()
-        discovered = {root_name: set() for root_name in CC_SESSION_ROOTS}
-        for root, account in roots:
-            for root_name, workspaces in self._history_workspaces(root, account).items():
-                discovered[root_name].update(workspaces)
-        targets = {root_name: [] for root_name in CC_SESSION_ROOTS}
-        for root_name, workspaces in discovered.items():
-            for root, account in roots:
-                for workspace in sorted(workspaces):
-                    folder = self._contained_path(root, root_name, workspace, account)
-                    key = "/".join(
-                        (
-                            _sha256(str(root.resolve())),
-                            root_name,
-                            workspace,
-                            _sha256(account),
-                        )
+                if not self._valid_name(name) or not isinstance(entry, dict):
+                    raise SnapshotValidationError("invalid catalog entry")
+                root = self._root_for_entry(name, entry)
+                if entry.get("storage_mode") == StorageMode.DEFAULT.value or _same_user_data_root(root, self.claude_dir):
+                    raise SnapshotValidationError("default Desktop root is excluded")
+                if root.absolute().parent != self.desktop_data_dir.absolute():
+                    raise SnapshotValidationError("root is outside managed desktop-data")
+                root = self._contained_path(self.cache_dir, "desktop-data", root.name)
+                config = _load_json(self._contained_path(root, "config.json"))
+                account = self._history_uuid(config.get("lastKnownAccountUuid"))
+                if entry.get("account_id_sha256") != _sha256(account):
+                    raise SnapshotValidationError("catalog/account mismatch; verify this login first")
+                account_dir = self._contained_path(root, CC_SESSION_ROOT, account)
+                organizations = []
+                if account_dir.is_dir():
+                    for folder in sorted(account_dir.iterdir()):
+                        if folder.is_dir():
+                            self._history_uuid(folder.name)
+                            organizations.append(self._contained_path(root, CC_SESSION_ROOT, account, folder.name))
+                if len(organizations) != 1:
+                    raise SnapshotValidationError(
+                        "no single verified account/org folder; open Code in this profile and verify its identity"
                     )
-                    targets[root_name].append((folder, key))
-        return targets
+                targets[organizations[0]] = (root, account)
+            except (OSError, ValueError, TypeError, DesktopBackendError) as error:
+                issues.append(f"{name}: {error}")
+        return targets, issues
 
     def _history_json_files(self, folder: Path) -> dict[str, Path]:
-        if not folder.is_dir() or folder.is_symlink():
-            return {}
-        files: dict[str, Path] = {}
-        for path in folder.iterdir():
-            if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".json":
-                continue
-            if path.suffix.lower() == JSONL_NAME or path.name.lower().endswith(".jsonl"):
-                continue
-            name = self._safe_history_segment(path.name)
-            files[name] = path
-        return files
+        # Only Desktop Code cards, never agent-mode state or referenced JSONL.
+        return {
+            path.name: self._contained_path(folder, path.name)
+            for path in sorted(folder.iterdir())
+            if path.name.startswith("local_") and path.suffix == ".json" and path.is_file()
+        }
 
-    def _backup_managed_histories(self, targets: dict[str, list[tuple[Path, str]]]) -> None:
-        destination = self.backups_dir / f"cc-predelete-{uuid.uuid4().hex}"
-        destination.mkdir(parents=True, exist_ok=False)
+    @staticmethod
+    def _history_activity(card: dict[str, Any]) -> Optional[float]:
+        value = card.get("lastActivityAt")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            # Accept epoch milliseconds/seconds; never fall back to file mtime.
+            try:
+                stamp = float(value / 1000 if value > 100_000_000_000 else value)
+            except OverflowError:
+                return None
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return None
+                stamp = parsed.timestamp()
+            except (ValueError, OverflowError):
+                return None
+        else:
+            return None
+        return stamp if math.isfinite(stamp) and stamp > 0 else None
+
+    @staticmethod
+    def _history_archive_state(card: dict[str, Any]) -> dict[str, Any]:
+        # Preserve every supplied archive field, including unknown future fields.
+        return {key: value for key, value in card.items() if "archiv" in key.lower()}
+
+    def _backup_history_card(self, path: Path, data: bytes, backup: Path) -> None:
+        relative = path.relative_to(self.desktop_data_dir)
+        # Flat names avoid MAX_PATH when a pending root already has long UUIDs.
+        destination = self._contained_path(backup, _sha256(str(relative)) + ".json")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            with destination.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if destination.read_bytes() != data:
+            raise DesktopBackendError("History backup verification failed")
+        index_path = backup / "index.json"
+        index = _load_json(index_path)
+        index[destination.name] = {"path": relative.as_posix(), "sha256": _sha256(data)}
+        _atomic_json(index_path, index)
+
+    def _write_history_card(self, destination: Path, data: bytes, previous: Optional[bytes]) -> Optional[str]:
+        temporary: Optional[Path] = None
+        committed = False
+        warning = None
         try:
-            copied = 0
-            for root_name, folders in targets.items():
-                for folder, key in folders:
-                    if folder.is_dir() and not folder.is_symlink():
-                        shutil.copytree(folder, destination / root_name / _sha256(key))
-                        copied += 1
-            if not copied:
-                shutil.rmtree(destination)
-                return
-        except Exception:
-            shutil.rmtree(destination, ignore_errors=True)
-            raise
-        old = sorted(
-            (path for path in self.backups_dir.glob("cc-predelete-*") if path.is_dir()),
-            key=lambda path: (path.stat().st_mtime_ns, path.name),
-        )
-        for obsolete in old[:-MAX_HISTORY_BACKUPS]:
-            shutil.rmtree(obsolete)
+            with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._fault_hook("history_staged")
+            self._contained_path(self.cache_dir, *destination.relative_to(self.cache_dir).parts)
+            if previous is None:
+                # Atomic create-without-replacement, even if Desktop just created it.
+                os.link(temporary, destination)
+            else:
+                if destination.read_bytes() != previous:
+                    raise DesktopBackendError("Card changed during sync; retry after closing this profile")
+                os.replace(temporary, destination)
+            committed = True
+        finally:
+            if temporary is not None and temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    if not committed:
+                        raise
+                    warning = f"Card saved; temporary file remains at {temporary}"
+        return warning
 
-    def _sync_histories_local(self) -> dict[str, int]:
-        targets = self._managed_history_targets()
-        manifest = _load_json(self.history_manifest)
-        report = {"added": 0, "removed": 0}
-        grouped: dict[tuple[str, str], list[tuple[Path, str]]] = {}
-        for root_name, folders in targets.items():
-            for folder, key in folders:
-                account_key = key.rsplit("/", 1)[-1]
-                grouped.setdefault((root_name, account_key), []).append((folder, key))
+    def _sync_histories_local(self) -> SyncReport:
+        targets, issues = self._managed_history_targets()
+        profiles_skipped = len(issues)
+        added = updated = skipped = failed = conflicts = 0
+        backup: Optional[Path] = None
+        cards: dict[str, list[tuple[Path, bytes, dict[str, Any]]]] = {}
+        invalid: set[str] = set()
+        for folder in targets:
+            try:
+                files = self._history_json_files(folder)
+            except (OSError, DesktopBackendError) as error:
+                failed += 1
+                issues.append(f"{folder}: cannot read cards ({error})")
+                continue
+            for name, path in files.items():
+                try:
+                    data = path.read_bytes()
+                    card = json.loads(data)
+                    if not isinstance(card, dict) or not card:
+                        raise ValueError("expected a nonempty card object")
+                    cards.setdefault(name, []).append((path, data, card))
+                except (OSError, UnicodeError, ValueError) as error:
+                    invalid.add(name)
+                    failed += 1
+                    issues.append(f"{path}: unreadable card ({type(error).__name__})")
 
-        deleted_by_group: dict[tuple[str, str], set[str]] = {}
-        for group, folders in grouped.items():
-            deleted: set[str] = set()
-            for folder, key in folders:
-                if not folder.is_dir():
+        for name, copies in sorted(cards.items()):
+            if name in invalid:
+                skipped += len(targets)
+                continue
+            source, data, card = copies[0]
+            if any(value != card for _path, _data, value in copies):
+                activities = [self._history_activity(value) for _path, _data, value in copies]
+                archive = self._history_archive_state(card)
+                archive_conflict = any(self._history_archive_state(value) != archive for _path, _data, value in copies)
+                if archive_conflict or any(value is None for value in activities):
+                    winner = []
+                else:
+                    newest = max(activities)
+                    winner = [copy for copy, activity in zip(copies, activities) if activity == newest]
+                if not winner or any(copy[2] != winner[0][2] for copy in winner):
+                    conflicts += 1
+                    skipped += len(targets)
+                    issues.append(f"{name}: archive/freshness conflict; copies preserved for manual review")
                     continue
-                current = set(self._history_json_files(folder))
-                previous = manifest.get(key, [])
-                if isinstance(previous, list):
-                    deleted.update(
-                        name for name in previous if isinstance(name, str) and name not in current
-                    )
-            if deleted:
-                deleted_by_group[group] = deleted
-
-        if deleted_by_group:
-            self._backup_managed_histories(targets)
-            for group, folders in grouped.items():
-                deleted = deleted_by_group.get(group, set())
-                for folder, _key in folders:
-                    if self._history_folder_is_live(folder):
+                source, data, card = winner[0]
+            existing = {path.parent: (raw, value) for path, raw, value in copies}
+            for folder, (root, account) in targets.items():
+                previous, value = existing.get(folder, (None, None))
+                if value == card:
+                    skipped += 1
+                    continue
+                try:
+                    destination = self._contained_path(self.cache_dir, *folder.relative_to(self.cache_dir).parts, name)
+                    if previous is not None and self._root_is_running(root):
+                        skipped += 1
+                        issues.append(f"{root.name}/{name}: running profile; close it and sync again to update this card")
                         continue
-                    for name in deleted:
-                        safe_name = self._safe_history_segment(name)
-                        path = self._contained_path(folder, safe_name)
-                        if path.is_file() and not path.is_symlink():
-                            path.unlink()
-                            report["removed"] += 1
-
-        new_manifest: dict[str, list[str]] = {}
-        for group, folders in grouped.items():
-            deleted = deleted_by_group.get(group, set())
-            union: dict[str, Path] = {}
-            for folder, _key in folders:
-                for name, path in self._history_json_files(folder).items():
-                    if name in deleted:
-                        continue
-                    current = union.get(name)
-                    if current is None or path.stat().st_mtime_ns > current.stat().st_mtime_ns:
-                        union[name] = path
-            for folder, key in folders:
-                folder.mkdir(parents=True, exist_ok=True)
-                for name, source in union.items():
-                    destination = self._contained_path(folder, name)
-                    if not destination.exists() or source.stat().st_mtime_ns > destination.stat().st_mtime_ns:
-                        shutil.copy2(source, destination)
-                        report["added"] += 1
-                new_manifest[key] = sorted(union)
-        _atomic_json(self.history_manifest, new_manifest)
-        return report
+                    if _load_json(self._contained_path(root, "config.json")).get("lastKnownAccountUuid") != account:
+                        raise DesktopBackendError("Profile identity changed during sync; verify this login first")
+                    self._contained_path(self.cache_dir, *source.relative_to(self.cache_dir).parts)
+                    if source.read_bytes() != data:
+                        raise DesktopBackendError("Source card changed during sync; retry")
+                    if backup is None:
+                        backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
+                    self._backup_history_card(source, data, backup)
+                    if previous is not None:
+                        self._backup_history_card(destination, previous, backup)
+                    warning = self._write_history_card(destination, data, previous)
+                    if previous is None:
+                        added += 1
+                    else:
+                        updated += 1
+                    if warning:
+                        issues.append(warning)
+                except (OSError, DesktopBackendError) as error:
+                    failed += 1
+                    issues.append(f"{folder}/{name}: {error}")
+        if not targets:
+            issues.append("No eligible Code folders. Save a login and open Code in each profile first.")
+        return SyncReport(
+            ok=failed == 0, added=added, updated=updated, skipped=skipped,
+            failed=failed, conflicts=conflicts, folders=len(targets), profiles_skipped=profiles_skipped,
+            backup=BackupRef(backup) if backup is not None else None,
+            message="\n".join(issues),
+        )
 
     def sync_histories(self) -> SyncReport:
         try:
@@ -1309,10 +1329,10 @@ class DesktopBackend:
             if isinstance(value, SyncReport):
                 return value
             if isinstance(value, dict):
-                return SyncReport(True, int(value.get("added", 0)), int(value.get("removed", value.get("deleted", 0))))
+                return SyncReport(True, added=int(value.get("added", 0)))
             return SyncReport(True)
         except Exception as error:
-            return SyncReport(False, message=str(error) or type(error).__name__)
+            return SyncReport(False, failed=1, message=str(error) or type(error).__name__)
         finally:
             self._clear_decryption_cache()
 

@@ -199,6 +199,73 @@ class GuiContractTests(unittest.TestCase):
         app._apply_tick.assert_called_once_with(True, True)
         app.root.after.assert_called_once_with(5000, app._tick)
 
+    def test_sync_preserves_partial_failure_counts_and_explains_scope_and_restart(self):
+        app = self.make_app()
+        backend = Mock()
+        report = SyncReport(
+            False, added=2, updated=1, skipped=4, failed=1, conflicts=1,
+            folders=2, message="fixture locked card",
+        )
+        backend.sync_histories.return_value = report
+        with patch.object(app_module, "_desktop_backend", return_value=backend), patch.object(
+            app_module.messagebox, "askyesno", return_value=True
+        ) as confirm, patch.object(app_module.threading, "Thread", ImmediateThread):
+            app._on_sync_histories()
+        self.assertEqual(("sync_done", report), app._q.get_nowait())
+        self.assertIn("different accounts", confirm.call_args.args[1])
+        self.assertIn("JSONL files are never read or changed", confirm.call_args.args[1])
+        with patch.object(app_module.messagebox, "showwarning") as warning:
+            app._handle_result("sync_done", report)
+        self.assertEqual("History Sync Needs Attention", warning.call_args.args[0])
+        for text in ("2 added, 1 updated, 4 skipped, 1 failed", "fixture locked card", "Restart", "Logins remain separate"):
+            self.assertIn(text, warning.call_args.args[1])
+        self.assertFalse(app._busy)
+        backend.stop_desktop.assert_not_called()
+        backend.launch_active.assert_not_called()
+
+    def test_sync_failure_without_folders_preserves_failure_title_and_message(self):
+        app = self.make_app()
+        report = SyncReport(False, failed=1, message="fixture backend failure")
+        with patch.object(app_module.messagebox, "showwarning") as warning:
+            app._handle_result("sync_done", report)
+        warning.assert_called_once()
+        self.assertEqual("History Sync Needs Attention", warning.call_args.args[0])
+        self.assertIn("fixture backend failure", warning.call_args.args[1])
+        self.assertEqual("fixture backend failure", report.message)
+
+    def test_sync_no_eligible_folders_is_not_reported_as_restored(self):
+        app = self.make_app()
+        with patch.object(app_module.messagebox, "showwarning") as warning:
+            app._handle_result("sync_done", SyncReport(True, message="Open Code in each profile"))
+        self.assertEqual("No Eligible Code Folders", warning.call_args.args[0])
+        self.assertIn("Open Code in each profile", warning.call_args.args[1])
+
+    def test_sync_success_shows_added_updated_and_skipped_counts(self):
+        app = self.make_app()
+        with patch.object(app_module.messagebox, "showinfo") as info:
+            app._handle_result("sync_done", SyncReport(True, added=3, updated=2, skipped=5, folders=2))
+        self.assertEqual("Local Code Cards Synced", info.call_args.args[0])
+        self.assertIn("3 added, 2 updated, 5 skipped, 0 failed", info.call_args.args[1])
+
+    def test_sync_dialog_bounds_issues_without_changing_full_report(self):
+        app = self.make_app()
+        message = "\n".join(
+            f"C:/fixture/very-long-profile-path/local_{index}.json: issue {index} " + "details " * 100
+            for index in range(20)
+        )
+        report = SyncReport(False, added=7, updated=2, skipped=15, failed=3, folders=2, message=message)
+        with patch.object(app_module.messagebox, "showwarning") as warning:
+            app._handle_result("sync_done", report)
+        visible = warning.call_args.args[1]
+        self.assertIn("7 added, 2 updated, 15 skipped, 3 failed", visible)
+        self.assertIn("local_0.json: issue 0", visible)
+        self.assertNotIn("very-long-profile-path", visible)
+        self.assertNotIn("local_5.json", visible)
+        self.assertIn("and 15 more issues", visible)
+        self.assertLess(len(visible), 1800)
+        self.assertTrue(all(len(line) <= 160 for line in visible.splitlines() if "local_" in line))
+        self.assertEqual(message, report.message)
+
     def test_tick_process_detection_error_is_queued(self) -> None:
         app = self.make_app()
         backend = Mock()
