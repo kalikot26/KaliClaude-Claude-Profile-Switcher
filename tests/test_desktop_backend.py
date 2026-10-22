@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -205,6 +206,39 @@ class IsolatedDesktopTests(unittest.TestCase):
 
     def profile_root(self, name: str) -> Path:
         return self.backend._root_for_entry(name, self.meta()["profiles"][name])
+
+    def test_crash_zeroed_catalog_is_refused_and_never_overwritten(self) -> None:
+        # 2026-10-22: a crash left meta.json full of NUL bytes; the empty
+        # fallback then let Prepare New Login save an empty catalog over it.
+        self.create_profile("john", "account-john", "org-a")
+        damaged = b"\x00" * self.backend.meta_file.stat().st_size
+        self.backend.meta_file.write_bytes(damaged)
+
+        for operation in (
+            self.backend.list_profiles,
+            self.backend.begin_new_login,
+            self.backend.audit_and_migrate,
+            lambda: self.backend.rename_profile("john", "johnny"),
+        ):
+            with self.assertRaisesRegex(DesktopBackendError, "unreadable"):
+                operation()
+            self.assertEqual(damaged, self.backend.meta_file.read_bytes())
+
+    def test_missing_catalog_still_starts_empty(self) -> None:
+        self.assertFalse(self.backend.meta_file.exists())
+        self.assertEqual([], self.backend.list_profiles())
+
+    def test_atomic_json_flushes_to_disk_before_replacing(self) -> None:
+        events: list[str] = []
+        real_replace = os.replace
+        with patch.object(desktop_backend.os, "fsync", side_effect=lambda _fd: events.append("fsync")), patch.object(
+            desktop_backend.os,
+            "replace",
+            side_effect=lambda source, target: (events.append("replace"), real_replace(source, target)),
+        ):
+            desktop_backend._atomic_json(self.cache / "value.json", {"kept": True})
+        self.assertEqual(["fsync", "replace"], events)
+        self.assertEqual({"kept": True}, json.loads((self.cache / "value.json").read_text(encoding="utf-8")))
 
     def test_exposes_schema_three_isolated_public_api(self) -> None:
         self.assertEqual(3, desktop_backend.MANIFEST_SCHEMA)

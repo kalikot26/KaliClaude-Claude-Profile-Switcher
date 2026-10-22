@@ -218,7 +218,12 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2, ensure_ascii=False))
+        handle.flush()
+        # Without this a crash can commit the rename before the data,
+        # leaving a NUL-filled file in place of the old one.
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
 
 
@@ -531,8 +536,25 @@ class DesktopBackend:
         self._os_crypt_key_cache: Optional[bytes] = None
         self._decryption_root: Optional[Path] = None
 
+    def _read_meta_file(self) -> dict[str, Any]:
+        # A missing catalog is a fresh install. An unreadable one (for example
+        # zero-filled by a crash) must stop every operation: treating it as
+        # empty lets the next save replace the only record of saved profiles.
+        if not self.meta_file.exists():
+            return {}
+        try:
+            meta = json.loads(self.meta_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            meta = None
+        if not isinstance(meta, dict):
+            raise DesktopBackendError(
+                f"The profile catalog {self.meta_file} is unreadable, possibly damaged by a crash. "
+                "It was left untouched; restore it from a backup before continuing."
+            )
+        return meta
+
     def _load_meta(self) -> dict[str, Any]:
-        meta = _load_json(self.meta_file)
+        meta = self._read_meta_file()
         if not isinstance(meta.get("profiles"), dict):
             meta["profiles"] = {}
         if not isinstance(meta.get("launch_proofs"), dict):
@@ -1782,7 +1804,7 @@ class DesktopBackend:
         previous_decryption_root = self._decryption_root
         self._decryption_root = self.claude_dir
         try:
-            raw_meta = _load_json(self.meta_file)
+            raw_meta = self._read_meta_file()
             report = MigrationReport()
             if raw_meta.get("schema") == MANIFEST_SCHEMA:
                 profiles = raw_meta.get("profiles")
