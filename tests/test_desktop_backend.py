@@ -314,6 +314,21 @@ class IsolatedDesktopTests(unittest.TestCase):
         with self.assertRaisesRegex(DesktopBackendError, "active profile"):
             self.backend.remove_profile("alpha")
 
+    def test_launch_does_not_leak_pyinstaller_bootloader_variables(self) -> None:
+        # Inherited by every shell inside Claude, these made a onefile exe
+        # started there abort: "parent process has different executable!".
+        self.create_profile("alpha", "uuid-a", "org-a")
+        self.create_profile("beta", "uuid-b", "org-b")
+        self.platform.pids = [101]
+        bundle = {"_PYI_ARCHIVE_FILE": "x.exe", "_PYI_PARENT_PROCESS_LEVEL": "1", "_MEIPASS2": "t", "KEEP_ME": "1"}
+
+        with patch.dict("os.environ", bundle):
+            self.assertTrue(self.backend.switch("alpha").ok)
+
+        _executable, env = self.platform.launches[-1]
+        self.assertEqual({"KEEP_ME"}, set(bundle) & set(env))
+        self.assertEqual(str(self.profile_root("alpha")), env["CLAUDE_USER_DATA_DIR"])
+
     def test_switch_copies_no_profile_storage_and_direct_launches_target(self) -> None:
         self.create_profile("alpha", "uuid-a", "org-a")
         self.create_profile("beta", "uuid-b", "org-b")

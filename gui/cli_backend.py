@@ -28,9 +28,9 @@ from typing import Any, Callable, Optional
 # to desktop_backend.py" boundary holds. Fallback mirrors app.py:28-41 (the
 # PyInstaller entry script runs from gui/ with no package parent).
 try:
-    from .desktop_backend import _atomic_json, _load_json, _sha256
+    from .desktop_backend import _atomic_json, _child_environment, _load_json, _sha256
 except ImportError:  # pragma: no cover - exercised only in the frozen build
-    from desktop_backend import _atomic_json, _load_json, _sha256  # type: ignore
+    from desktop_backend import _atomic_json, _child_environment, _load_json, _sha256  # type: ignore
 
 CREDS_NAME = ".credentials.json"
 ACCOUNT_NAME = "account.json"
@@ -489,7 +489,7 @@ class CliBackend:
         executable = self.resolve_cli()
         # Partner-model pairing runs against the live store, so the child just
         # inherits the current environment (no CLAUDE_CONFIG_DIR relocation).
-        process = self._spawner(["cmd.exe", "/k", str(executable)], dict(os.environ))
+        process = self._spawner(["cmd.exe", "/k", str(executable)], _child_environment())
         deadline = time.monotonic() + self._pair_timeout
         while time.monotonic() < deadline:
             if self.live_creds.is_file():
@@ -658,7 +658,7 @@ class CliBackend:
         creds = account_dir / CREDS_NAME
         executable = self.resolve_cli()
 
-        env = dict(os.environ)
+        env = _child_environment()
         env[CLAUDE_CONFIG_DIR] = str(account_dir)
         process = self._spawner(["cmd.exe", "/k", str(executable)], env)
 

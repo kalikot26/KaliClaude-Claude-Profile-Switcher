@@ -227,6 +227,17 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+# The PyInstaller onefile bootloader sets these for its own child process.
+# Passed on, they make any onefile exe later started from a Claude shell
+# (KaliClaude included) abort: "parent process has different executable!".
+_BUNDLE_ENV_PREFIXES = ("_PYI_", "_MEI")
+
+
+def _child_environment() -> dict[str, str]:
+    """Copy of os.environ for processes KaliClaude starts, minus its bundle state."""
+    return {name: value for name, value in os.environ.items() if not name.upper().startswith(_BUNDLE_ENV_PREFIXES)}
+
+
 def _version_key(version: str) -> tuple[int, ...]:
     """Sort dotted installer versions numerically, not lexicographically."""
     return tuple(int(part) for part in re.findall(r"\d+", version)) or (0,)
@@ -1022,7 +1033,7 @@ class DesktopBackend:
                 already_isolation_verified=True,
             )
         before = self._log_bytes(root)
-        environment = dict(os.environ)
+        environment = _child_environment()
         environment["CLAUDE_USER_DATA_DIR"] = str(root)
         self._process.launch(executable, environment)
         deadline = time.monotonic() + self._launch_timeout

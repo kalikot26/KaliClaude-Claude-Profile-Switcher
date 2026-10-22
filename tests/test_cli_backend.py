@@ -208,6 +208,18 @@ class CliBackendTests(unittest.TestCase):
         self.assertEqual(["cmd.exe", "/k", str(Path("C:/fake/claude.exe"))], spawner.argv)
         self.assertEqual(b"NEW", (self.cli_data("beta") / CREDS).read_bytes())
 
+    def test_login_terminals_do_not_leak_pyinstaller_bootloader_variables(self) -> None:
+        bundle = {"_PYI_ARCHIVE_FILE": "x.exe", "_PYI_PARENT_PROCESS_LEVEL": "1", "_MEIPASS2": "t", "KEEP_ME": "1"}
+        pair = FakeSpawner(self.home / ".claude" / CREDS, create_on=1, payload=b"NEW")
+        pool = FakeSpawner(self.home / ".claude" / CREDS, create_on=1, payload=b"POOL")
+
+        with patch.dict(os.environ, bundle):
+            self.assertTrue(self.make(spawner=pair, which=lambda name: "claude").pair("beta").ok)
+            self.assertTrue(self.make(spawner=pool, which=lambda name: "claude").pool_add("work").ok)
+
+        for spawner in (pair, pool):
+            self.assertEqual({"KEEP_ME"}, set(bundle) & set(spawner.env))
+
     def test_pair_adopts_existing_live_without_spawning(self) -> None:
         self.write_live(b"LIVE")
         self.write_claude_json(uuid="U1", email="john@example.invalid")
