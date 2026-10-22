@@ -314,6 +314,33 @@ class IsolatedDesktopTests(unittest.TestCase):
         with self.assertRaisesRegex(DesktopBackendError, "active profile"):
             self.backend.remove_profile("alpha")
 
+    def test_launch_opens_selected_profile_not_a_leftover_pending_login(self) -> None:
+        # 2026-10-22: a pending login left over from a crash made Launch open
+        # an empty window instead of the selected profile's history.
+        self.create_profile("alpha", "uuid-a", "org-a")
+        pending = self.backend.begin_new_login()
+
+        self.assertTrue(self.backend.launch_active().ok)
+        self.assertEqual(str(self.profile_root("alpha")), self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"])
+
+        self.assertTrue(self.backend.launch_pending().ok)
+        self.assertEqual(str(pending.user_data_dir), self.platform.launches[-1][1]["CLAUDE_USER_DATA_DIR"])
+
+    def test_signed_in_main_app_roots_reports_only_roots_holding_a_login(self) -> None:
+        store = Path(self.temp.name) / "StoreClaude"
+        backend = DesktopBackend(
+            claude_dir=self.default_root, cache_dir=self.cache, store_claude_dir=store, process_adapter=self.platform
+        )
+        self.assertEqual([], backend.signed_in_main_app_roots())
+
+        self.seed_root(store, account_uuid="uuid-main", organization="org-main")
+        self.assertEqual([store], backend.signed_in_main_app_roots())
+
+        # Signed out: Desktop keeps lastKnownAccountUuid but drops the token cache.
+        (store / "config.json").write_text(json.dumps({"lastKnownAccountUuid": "uuid-main"}), encoding="utf-8")
+        self.seed_root(self.default_root, account_uuid="uuid-main", organization="org-main")
+        self.assertEqual([self.default_root], backend.signed_in_main_app_roots())
+
     def test_launch_does_not_leak_pyinstaller_bootloader_variables(self) -> None:
         # Inherited by every shell inside Claude, these made a onefile exe
         # started there abort: "parent process has different executable!".

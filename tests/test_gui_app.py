@@ -81,7 +81,7 @@ class GuiContractTests(unittest.TestCase):
         launch = LaunchResult(True, pending.name, pending.user_data_dir)
         backend = Mock()
         backend.begin_new_login.return_value = pending
-        backend.launch_active.return_value = launch
+        backend.launch_pending.return_value = launch
 
         with patch.object(app_module, "_desktop_backend", return_value=backend), patch.object(
             app_module.messagebox, "askyesno", return_value=True
@@ -90,7 +90,8 @@ class GuiContractTests(unittest.TestCase):
 
         self.assertEqual(("prep_ok", (pending, launch)), app._q.get_nowait())
         backend.begin_new_login.assert_called_once_with()
-        backend.launch_active.assert_called_once_with()
+        backend.launch_pending.assert_called_once_with()
+        backend.launch_active.assert_not_called()
         backend.stop_desktop.assert_not_called()
         self.assertFalse(hasattr(backend, "prepare_new_login") and backend.prepare_new_login.called)
 
@@ -104,7 +105,7 @@ class GuiContractTests(unittest.TestCase):
                 app = self.make_app()
                 backend = Mock()
                 backend.begin_new_login.return_value = pending
-                backend.launch_active.return_value = launch
+                backend.launch_pending.return_value = launch
                 with patch.object(app_module, "_desktop_backend", return_value=backend), patch.object(
                     app_module.messagebox, "askyesno", return_value=True
                 ), patch.object(app_module.threading, "Thread", ImmediateThread):
@@ -380,6 +381,42 @@ class GuiContractTests(unittest.TestCase):
         self.assertEqual("switch_ok", app._q.get_nowait()[0])
         self.assertEqual("cli_switch", app._q.get_nowait()[0])
         cli.switch_to.assert_called_once_with("beta", "alpha")
+
+    def test_switch_reopens_selected_profile_without_cli_swap(self) -> None:
+        # The selected profile's window may be closed; Switch must reopen it.
+        app = self.make_app()
+        app._profiles = [self.profile()]
+        app._sel = 0
+        desktop = Mock()
+        desktop.switch.return_value = SwitchResult(True, "alpha")
+        cli = Mock()
+
+        with patch.object(app_module, "_desktop_backend", return_value=desktop), patch.object(
+            app_module, "_cli_backend", return_value=cli
+        ), patch.object(app_module.messagebox, "askyesno", return_value=True), patch.object(
+            app_module.threading, "Thread", ImmediateThread
+        ):
+            app._on_switch()
+
+        self.assertEqual(("switch_ok", desktop.switch.return_value), app._q.get_nowait())
+        desktop.switch.assert_called_once_with("alpha")
+        cli.switch_to.assert_not_called()
+        self.assertTrue(app._q.empty())
+
+    def test_startup_warns_when_main_claude_app_is_signed_in(self) -> None:
+        app = self.make_app()
+        app._migration_report = None
+        backend = Mock()
+        backend.signed_in_main_app_roots.return_value = [Path("C:/fixture/main-app")]
+
+        with patch.object(app_module, "_desktop_backend", return_value=backend), patch.object(
+            app_module.messagebox, "showwarning"
+        ) as warning:
+            app._show_startup_audit()
+
+        title, message = warning.call_args.args
+        self.assertEqual("Main Claude App Is Signed In", title)
+        self.assertIn("C:", message)
 
     def test_cli_partner_failure_never_touches_desktop_switch(self) -> None:
         app = self.make_app()
