@@ -32,6 +32,7 @@ from typing import Any, Callable, Optional
 MANIFEST_SCHEMA = 3
 OAUTH_KEY_V1 = "oauth:tokenCache"
 OAUTH_KEY_V2 = "oauth:tokenCacheV2"
+STORE_PACKAGE_FAMILY = "Claude_pzs8sxrjxfjjc"
 MAX_OPERATIONAL_BACKUPS = 5
 CC_SESSION_ROOT = "claude-code-sessions"
 _USER_DATA_DIR_RE = re.compile(
@@ -518,6 +519,7 @@ class DesktopBackend:
         *,
         claude_dir: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
+        store_claude_dir: Optional[Path] = None,
         oauth_decoder: Optional[Callable[[str], Optional[dict]]] = None,
         cookie_decoder: Optional[Callable[[bytes], Optional[str]]] = None,
         claude_version: Optional[Callable[[], str]] = None,
@@ -529,7 +531,13 @@ class DesktopBackend:
     ) -> None:
         home = Path.home()
         appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        localappdata = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
         self.claude_dir = claude_dir or appdata / "Claude"
+        # The Store (MSIX) app virtualizes %APPDATA%\Claude into its package
+        # folder, so the main app's real login lives here, not in claude_dir.
+        self.store_claude_dir = store_claude_dir or (
+            localappdata / "Packages" / STORE_PACKAGE_FAMILY / "LocalCache" / "Roaming" / "Claude"
+        )
         self.cache_dir = cache_dir or home / ".kalikot-claude-switcher"
         self.desktop_data_dir = self.cache_dir / "desktop-data"
         self.profiles_dir = self.cache_dir / "profiles"  # read-only legacy store for Task 2
@@ -671,6 +679,19 @@ class DesktopBackend:
             return self._root_for_entry(active, entry) if isinstance(entry, dict) else self.claude_dir
         finally:
             self._clear_decryption_cache()
+
+    def signed_in_main_app_roots(self) -> list[Path]:
+        """Main-app (non-clone) Desktop roots that currently hold a login.
+
+        Owner rule: only isolated clones hold logins, so switching never signs
+        a running app in or out. The GUI warns about anything returned here.
+        """
+        signed_in = []
+        for root in dict.fromkeys((self.claude_dir, self.store_claude_dir)):
+            config = _load_json(root / "config.json")
+            if any(str(config.get(key) or "").strip() not in ("", "{}", "null") for key in (OAUTH_KEY_V1, OAUTH_KEY_V2)):
+                signed_in.append(root)
+        return signed_in
 
     def begin_new_login(self) -> PendingLogin:
         try:
@@ -1066,26 +1087,41 @@ class DesktopBackend:
             entry["state"] = ProfileState.READY.value
             entry["state_reason"] = ""
 
-    def launch_active(self) -> LaunchResult:
+    def launch_pending(self) -> LaunchResult:
+        """Open the root Prepare New Login created; nothing else launches it."""
         try:
             meta = self._load_meta()
             pending = meta.get("pending_login")
-            if isinstance(pending, dict) and isinstance(pending.get("name"), str):
-                name = pending["name"]
-                root = self.desktop_data_dir / name
-                if not root.is_dir():
-                    return LaunchResult(False, name, root, "The pending login root is missing")
-                executable = self._resolve_executable()
-                try:
-                    verification = self._launch_root(root, executable, set(meta["launch_proofs"]))
-                except Exception as error:
-                    return LaunchResult(False, name, root, str(error) or type(error).__name__)
-                if not verification.already_isolation_verified:
-                    meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
-                    self._save_meta(meta)
-                return LaunchResult(True, name, root)
+            if not isinstance(pending, dict) or not isinstance(pending.get("name"), str):
+                return LaunchResult(False, message="No pending login is waiting")
+            name = pending["name"]
+            root = self.desktop_data_dir / name
+            if not root.is_dir():
+                return LaunchResult(False, name, root, "The pending login root is missing")
+            executable = self._resolve_executable()
+            try:
+                verification = self._launch_root(root, executable, set(meta["launch_proofs"]))
+            except Exception as error:
+                return LaunchResult(False, name, root, str(error) or type(error).__name__)
+            if not verification.already_isolation_verified:
+                meta["launch_proofs"][verification.proof_key] = {"verified_at": time.time()}
+                self._save_meta(meta)
+            return LaunchResult(True, name, root)
+        finally:
+            self._clear_decryption_cache()
+
+    def launch_active(self) -> LaunchResult:
+        """Open the selected profile; a pending login is only a fallback.
+
+        A pending login left unsaved (for example by a crash) must never hide
+        the selected profile behind an empty window.
+        """
+        try:
+            meta = self._load_meta()
             name = meta.get("desktop_active")
             if not isinstance(name, str):
+                if isinstance(meta.get("pending_login"), dict):
+                    return self.launch_pending()
                 return LaunchResult(False, message="No Desktop profile is selected")
             _entry, root = self._validated_profile(name)
             executable = self._resolve_executable()

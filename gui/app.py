@@ -573,6 +573,20 @@ class App:
                 parent=self.root,
             )
             return
+        try:
+            signed_in = _desktop_backend().signed_in_main_app_roots()
+        except Exception:
+            signed_in = []
+        if signed_in:
+            messagebox.showwarning(
+                "Main Claude App Is Signed In",
+                "Only KaliClaude profile windows should hold a login. The main "
+                "Claude app is signed in here:\n\n"
+                + "\n".join(f"• {root}" for root in signed_in)
+                + "\n\nSign out of the main app, or close it and move that folder "
+                "aside, so profile sessions are never signed out under you.",
+                parent=self.root,
+            )
         report = self._migration_report
         blocked = list(report.needs_relogin) + list(report.corrupt) if report else []
         if blocked:
@@ -943,10 +957,11 @@ class App:
         self._render_usage(p)
 
         actions_enabled = not self._startup_error
-        if p.is_active:
-            self._btn_switch.configure(text="Active Now", state=tk.DISABLED,
-                                       bg=BG_CARD, fg=TXT_MUTE,
-                                       activebackground=BG_CARD)
+        if p.is_active and p.has_blob:
+            # Selected already, but its window may be closed: still openable.
+            self._btn_switch.configure(text="Open this Profile", state=tk.NORMAL,
+                                       bg=CLR_ACCENT, fg="#17140F",
+                                       activebackground="#BF6330")
         elif not p.has_blob:
             self._btn_switch.configure(text="Re-login / Re-save", state=tk.NORMAL,
                                        bg=CLR_ACCENT, fg="#17140F",
@@ -1057,7 +1072,12 @@ class App:
         active = next((p.name for p in self._profiles if p.is_active), None)
         n = len(self._profiles)
         live_status = f"  ·  Active: {active}" if active else ""
-        self._set_status(f"{n} profile{'s' if n != 1 else ''}" + live_status)
+        try:
+            main_signed_in = bool(_desktop_backend().signed_in_main_app_roots())
+        except Exception:
+            main_signed_in = False
+        main_status = "  ·  Warning: main Claude app is signed in" if main_signed_in else ""
+        self._set_status(f"{n} profile{'s' if n != 1 else ''}" + live_status + main_status)
 
     def _tick(self):
         def check():
@@ -1219,12 +1239,10 @@ class App:
         if not self._action_ready(require_selection=True):
             return
         p = self._profiles[self._sel]
-        if p.is_active:
-            return
         if not p.has_blob:
             self._on_relogin_profile(p)
             return
-        msg = f"Switch Claude to profile  '{p.name}'?"
+        msg = f"Open profile  '{p.name}'?" if p.is_active else f"Switch Claude to profile  '{p.name}'?"
         msg += (
             "\n\nThis opens or focuses a second Claude window using only the selected "
             "isolated profile root. The default Desktop root is not used."
@@ -1244,6 +1262,8 @@ class App:
             try:
                 result = _desktop_backend().switch(target)
                 self._q.put(("switch_ok", result))
+                if target == outgoing:
+                    return  # reopening the selected profile: its CLI login is already live
                 # CLI partner swap: strictly after the desktop switch, fully
                 # guarded — an exception here must never touch the desktop result.
                 try:
@@ -1291,7 +1311,7 @@ class App:
                 backend = _desktop_backend()
                 pending = backend.begin_new_login()
                 try:
-                    launch = backend.launch_active()
+                    launch = backend.launch_pending()
                     if not launch.ok:
                         raise RuntimeError(launch.message or "Pending login launch failed")
                     if launch.user_data_dir != pending.user_data_dir:
