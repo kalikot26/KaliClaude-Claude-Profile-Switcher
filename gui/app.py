@@ -1607,6 +1607,8 @@ class App:
                 f"{data.added} added, {data.updated} updated, "
                 f"{data.skipped} skipped, {data.failed} failed."
             )
+            if data.leases:
+                summary += f" {data.leases} worktree lease{'s' if data.leases != 1 else ''} carried."
             self._set_status(f"Local Code card sync: {summary}")
             details = (
                 f"{summary}\n{data.folders} verified profile folders; "
