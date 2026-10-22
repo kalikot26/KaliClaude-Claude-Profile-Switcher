@@ -237,6 +237,76 @@ class HistorySyncTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertEqual(concurrent, (self.beta / CARD).read_bytes())
 
+    def worktree(self, branch):
+        # Linked worktree layout: a .git pointer file plus the gitdir's HEAD.
+        folder = self.home / "repo" / ".claude" / "worktrees" / "wt1"
+        gitdir = self.home / "repo" / ".git" / "worktrees" / "wt1"
+        folder.mkdir(parents=True)
+        gitdir.mkdir(parents=True)
+        (folder / ".git").write_text(f"gitdir: {gitdir}\n")
+        (gitdir / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+        return folder
+
+    @staticmethod
+    def registry(folder, worktrees):
+        path = folder.parents[2] / "git-worktrees.json"
+        path.write_text(json.dumps({"schemaVersion": 2, "worktrees": worktrees}))
+        return path
+
+    @staticmethod
+    def lease(path, leased_by, branch, **extra):
+        return {"name": "wt1", "path": str(path), "leasedBy": leased_by, "branch": branch,
+                "sourceBranch": "master", "createdAt": 1, **extra}
+
+    def stale_lease_fixture(self):
+        # 2026-10-22: MAIN took over B4b's folder; beta still leased it to B4b,
+        # so beta refused to resume MAIN ("branch is checked out in another folder").
+        main, old = "local_" + CARD[6:-5], "local_" + OTHER[6:-5]
+        wt = self.worktree("claude/main")
+        self.card(self.alpha, sessionId=main, cwd=str(wt), branch="claude/main")
+        self.card(self.beta, OTHER, sessionId=old, cwd=str(wt), branch="kalikot/old")
+        truth = self.lease(wt, main, "claude/main", anchors=["kept"])
+        unrelated = {"name": "keep", "path": "P:/x", "leasedBy": old, "branch": "b"}
+        alpha_registry = self.registry(self.alpha, {"wt1": truth})
+        beta_registry = self.registry(self.beta, {"wt1": self.lease(wt, old, "kalikot/old"), "keep": unrelated})
+        return truth, unrelated, alpha_registry, beta_registry
+
+    def test_stale_worktree_lease_is_replaced_by_the_lease_matching_disk(self):
+        truth, unrelated, alpha_registry, beta_registry = self.stale_lease_fixture()
+        alpha_before, beta_before = alpha_registry.read_bytes(), beta_registry.read_bytes()
+
+        report = self.backend.sync_histories()
+
+        self.assertTrue(report.ok, report.message)
+        self.assertEqual(1, report.leases)
+        self.assertEqual({"wt1": truth, "keep": unrelated}, json.loads(beta_registry.read_bytes())["worktrees"])
+        self.assertEqual(alpha_before, alpha_registry.read_bytes())
+        saved = {entry["path"]: entry for entry in json.loads((report.backup.path / "index.json").read_bytes()).values()}
+        entry = saved[beta_registry.relative_to(self.backend.desktop_data_dir).as_posix()]
+        self.assertEqual(_sha256(beta_before), entry["sha256"])
+
+    def test_missing_worktree_lease_is_left_for_desktop(self):
+        _truth, _unrelated, _alpha_registry, beta_registry = self.stale_lease_fixture()
+        beta_registry.write_text(json.dumps({"schemaVersion": 2, "worktrees": {}}))
+        before = beta_registry.read_bytes()
+
+        report = self.backend.sync_histories()
+
+        self.assertEqual(0, report.leases)
+        self.assertEqual(before, beta_registry.read_bytes())
+
+    def test_running_profile_worktree_lease_is_flagged_not_written(self):
+        _truth, _unrelated, _alpha_registry, beta_registry = self.stale_lease_fixture()
+        before = beta_registry.read_bytes()
+
+        with patch.object(self.backend, "_root_is_running", return_value=True):
+            report = self.backend.sync_histories()
+
+        self.assertEqual(0, report.leases)
+        self.assertEqual(before, beta_registry.read_bytes())
+        self.assertIn("wt1", report.message)
+        self.assertIn("close this profile and sync again", report.message)
+
     def test_running_profile_updates_are_skipped_without_stopping_sessions(self):
         self.card(self.alpha, activity="2026-09-11T06:00:00Z")
         self.card(self.beta)

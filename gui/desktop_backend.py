@@ -35,6 +35,7 @@ OAUTH_KEY_V2 = "oauth:tokenCacheV2"
 STORE_PACKAGE_FAMILY = "Claude_pzs8sxrjxfjjc"
 MAX_OPERATIONAL_BACKUPS = 5
 CC_SESSION_ROOT = "claude-code-sessions"
+WORKTREE_REGISTRY = "git-worktrees.json"
 _USER_DATA_DIR_RE = re.compile(
     r"--user-data-dir(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|(\S+))",
     re.IGNORECASE,
@@ -121,6 +122,7 @@ class SyncReport:
     folders: int = 0
     profiles_skipped: int = 0
     backup: Optional[BackupRef] = None
+    leases: int = 0
 
 
 @dataclass(frozen=True)
@@ -246,6 +248,20 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 def _windows_path_key(path: Path | str) -> str:
     return str(path).replace("/", "\\").lower()
+
+
+def _worktree_branch(folder: Path) -> Optional[str]:
+    """Branch checked out in a linked git worktree, read without running git."""
+    try:
+        pointer = (folder / ".git").read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir:"):
+            return None
+        gitdir = Path(pointer[len("gitdir:"):].strip())
+        head = ((gitdir if gitdir.is_absolute() else folder / gitdir) / "HEAD").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    prefix = "ref: refs/heads/"
+    return head[len(prefix):] if head.startswith(prefix) else None
 
 
 def _is_codex_virtualized_path(path: Path | str) -> bool:
@@ -1383,14 +1399,108 @@ class DesktopBackend:
                 except (OSError, DesktopBackendError) as error:
                     failed += 1
                     issues.append(f"{folder}/{name}: {error}")
+        leases, lease_failures, lease_issues, backup = self._carry_worktree_leases(targets, backup)
+        failed += lease_failures
+        issues.extend(lease_issues)
         if not targets:
             issues.append("No eligible Code folders. Save a login and open Code in each profile first.")
         return SyncReport(
             ok=failed == 0, added=added, updated=updated, skipped=skipped,
             failed=failed, conflicts=conflicts, folders=len(targets), profiles_skipped=profiles_skipped,
             backup=BackupRef(backup) if backup is not None else None,
-            message="\n".join(issues),
+            message="\n".join(issues), leases=leases,
         )
+
+    def _carry_worktree_leases(
+        self, targets: dict[Path, tuple[Path, str]], backup: Optional[Path]
+    ) -> tuple[int, int, list[str], Optional[Path]]:
+        """Make each profile's worktree leases agree with the branch on disk.
+
+        Every clone keeps its own git-worktrees.json. Cards are shared but
+        leases are not, so a clone holding a stale lease on a card's folder
+        refuses to resume it ("branch is checked out in another folder"). The
+        branch actually checked out decides: an entry on that branch, leased to
+        a chat on that branch, replaces the entry for the same folder in every
+        clone that has that chat. Running clones are only reported, because
+        Desktop rewrites its registry from memory.
+        """
+        carried = failed = 0
+        issues: list[str] = []
+        clones = []
+        for folder, (root, _account) in targets.items():
+            try:
+                path = self._contained_path(root, WORKTREE_REGISTRY)
+                if not path.is_file():
+                    continue
+                raw = path.read_bytes()
+                registry = json.loads(raw)
+                if not isinstance(registry, dict) or not isinstance(registry.get("worktrees"), dict):
+                    raise ValueError("unexpected registry shape")
+                chats = {}
+                for card_path in self._history_json_files(folder).values():
+                    card = json.loads(card_path.read_bytes())
+                    if isinstance(card, dict) and all(isinstance(card.get(key), str) for key in ("sessionId", "cwd", "branch")):
+                        chats[card["sessionId"]] = (_windows_path_key(card["cwd"]), card["branch"])
+            except (OSError, UnicodeError, ValueError, DesktopBackendError) as error:
+                failed += 1
+                issues.append(f"{root.name}/{WORKTREE_REGISTRY}: unreadable ({type(error).__name__})")
+                continue
+            clones.append((root, path, raw, registry, chats))
+
+        def lease(entry: Any) -> tuple:
+            return (entry.get("leasedBy"), entry.get("branch"), _windows_path_key(str(entry.get("path")))) if isinstance(entry, dict) else ()
+
+        def holds(chats: dict, entry: dict) -> bool:
+            leased_by, branch, path_key = lease(entry)
+            return chats.get(leased_by) == (path_key, branch)
+
+        truth: dict[str, tuple[dict[str, Any], Any]] = {}
+        ambiguous: set[str] = set()
+        for _root, _path, _raw, registry, chats in clones:
+            for name, entry in registry["worktrees"].items():
+                if not (isinstance(entry, dict) and isinstance(entry.get("path"), str) and holds(chats, entry)):
+                    continue
+                if _worktree_branch(Path(entry["path"])) != entry.get("branch"):
+                    continue
+                if name in truth and lease(truth[name][0]) != lease(entry):
+                    ambiguous.add(name)
+                truth.setdefault(name, (entry, registry.get("schemaVersion")))
+        for name in sorted(ambiguous):
+            truth.pop(name)
+            issues.append(f"{WORKTREE_REGISTRY}/{name}: two chats lease the checked-out branch; leases left for manual review")
+
+        for root, path, raw, registry, chats in clones:
+            changed, running = [], None
+            for name, (entry, schema) in sorted(truth.items()):
+                current = registry["worktrees"].get(name)
+                # Only correct a wrong entry. A missing one is left to Desktop,
+                # which re-leases the folder in place, and adding entries would
+                # let this clone release or remove folders it never used.
+                if current is None or lease(current) == lease(entry) or not holds(chats, entry):
+                    continue
+                if registry.get("schemaVersion") != schema:
+                    issues.append(f"{root.name}/{name}: worktree lease not carried; registry versions differ")
+                    continue
+                running = self._root_is_running(root) if running is None else running
+                if running:
+                    issues.append(f"{root.name}/{name}: worktree lease is stale; close this profile and sync again so its chat can resume there")
+                    continue
+                registry["worktrees"][name] = entry
+                changed.append(name)
+            if not changed:
+                continue
+            try:
+                if backup is None:
+                    backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
+                self._backup_history_card(path, raw, backup)
+                warning = self._write_history_card(path, json.dumps(registry, indent=2).encode("utf-8"), raw)
+                carried += len(changed)
+                if warning:
+                    issues.append(warning)
+            except (OSError, DesktopBackendError) as error:
+                failed += 1
+                issues.append(f"{root.name}/{WORKTREE_REGISTRY}: {error}")
+        return carried, failed, issues, backup
 
     def sync_histories(self) -> SyncReport:
         try:
