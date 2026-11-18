@@ -1270,9 +1270,10 @@ class DesktopBackend:
         return stamp if math.isfinite(stamp) and stamp > 0 else None
 
     @staticmethod
-    def _history_archive_state(card: dict[str, Any]) -> dict[str, Any]:
-        # Preserve every supplied archive field, including unknown future fields.
-        return {key: value for key, value in card.items() if "archiv" in key.lower()}
+    def _history_card_matches(left: Optional[dict[str, Any]], right: dict[str, Any]) -> bool:
+        # Python dict equality treats JSON true and 1 as equal.
+        return (left is not None and left == right
+                and (left.get("isArchived") is True) == (right.get("isArchived") is True))
 
     def _backup_history_card(self, path: Path, data: bytes, backup: Path) -> None:
         relative = path.relative_to(self.desktop_data_dir)
@@ -1352,15 +1353,14 @@ class DesktopBackend:
                 skipped += len(targets)
                 continue
             source, data, card = copies[0]
-            if any(value != card for _path, _data, value in copies):
-                activities = [self._history_activity(value) for _path, _data, value in copies]
-                archive = self._history_archive_state(card)
-                archive_conflict = any(self._history_archive_state(value) != archive for _path, _data, value in copies)
-                if archive_conflict or any(value is None for value in activities):
+            if any(not self._history_card_matches(value, card) for _path, _data, value in copies):
+                keys = [(self._history_activity(value), value.get("isArchived") is True)
+                        for _path, _data, value in copies]
+                if any(activity is None for activity, _archived in keys):
                     winner = []
                 else:
-                    newest = max(activities)
-                    winner = [copy for copy, activity in zip(copies, activities) if activity == newest]
+                    best_key = max(keys)
+                    winner = [copy for copy, key in zip(copies, keys) if key == best_key]
                 if not winner or any(copy[2] != winner[0][2] for copy in winner):
                     conflicts += 1
                     skipped += len(targets)
@@ -1370,7 +1370,7 @@ class DesktopBackend:
             existing = {path.parent: (raw, value) for path, raw, value in copies}
             for folder, (root, account) in targets.items():
                 previous, value = existing.get(folder, (None, None))
-                if value == card:
+                if self._history_card_matches(value, card):
                     skipped += 1
                     continue
                 try:
