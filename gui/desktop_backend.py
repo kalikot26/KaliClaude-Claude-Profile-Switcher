@@ -394,7 +394,7 @@ class WindowsDesktopProcessAdapter:
             raise OSError("Claude Desktop switching is Windows-only")
         rows = json.loads(
             self._run(
-                "@(Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | "
+                "@(Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" -ErrorAction Stop | "
                 "Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine) | ConvertTo-Json -Compress"
             )
             or "[]"
@@ -1275,7 +1275,9 @@ class DesktopBackend:
         return (left is not None and left == right
                 and (left.get("isArchived") is True) == (right.get("isArchived") is True))
 
-    def _backup_history_card(self, path: Path, data: bytes, backup: Path) -> None:
+    def _backup_history_card(
+        self, path: Path, data: bytes, backup: Path, index: dict[str, dict[str, str]]
+    ) -> None:
         relative = path.relative_to(self.desktop_data_dir)
         # Flat names avoid MAX_PATH when a pending root already has long UUIDs.
         destination = self._contained_path(backup, _sha256(str(relative)) + ".json")
@@ -1287,10 +1289,14 @@ class DesktopBackend:
                 os.fsync(stream.fileno())
         if destination.read_bytes() != data:
             raise DesktopBackendError("History backup verification failed")
-        index_path = backup / "index.json"
-        index = _load_json(index_path)
+        if destination.name in index:
+            return
         index[destination.name] = {"path": relative.as_posix(), "sha256": _sha256(data)}
-        _atomic_json(index_path, index)
+        try:
+            _atomic_json(backup / "index.json", index)
+        except OSError:
+            del index[destination.name]
+            raise
 
     def _write_history_card(self, destination: Path, data: bytes, previous: Optional[bytes]) -> Optional[str]:
         temporary: Optional[Path] = None
@@ -1327,6 +1333,38 @@ class DesktopBackend:
         profiles_skipped = len(issues)
         added = updated = skipped = failed = conflicts = 0
         backup: Optional[Path] = None
+        backup_index: dict[str, dict[str, str]] = {}
+        running: dict[Path, bool | str] = {}
+        rechecked: dict[Path, bool | str] = {}
+
+        def write_blocked(root: Path, before_write: bool, *, adding: bool = False) -> bool:
+            # ponytail: Running state can be up to one sync old after the first-write recheck.
+            if not running:
+                roots = {target_root for target_root, _account in targets.values()}
+                try:
+                    process_roots = [self._process_user_data_dir(p) for p in self._desktop_processes()]
+                    running.update({
+                        target_root: any(_same_user_data_root(process_root, target_root)
+                                         for process_root in process_roots)
+                        for target_root in roots
+                    })
+                except Exception as error:
+                    running.update(dict.fromkeys(roots, str(error) or type(error).__name__))
+            initial = running[root]
+            if before_write and isinstance(initial, bool) and root not in rechecked:
+                try:
+                    rechecked[root] = self._root_is_running(root)
+                except Exception as error:
+                    rechecked[root] = str(error) or type(error).__name__
+            state = rechecked.get(root, initial)
+            if isinstance(state, str):
+                raise DesktopBackendError(state)
+            # Existing running profiles permit atomic creates. A new launch
+            # invalidates the snapshot for every pending write to that root.
+            if initial:
+                return not adding
+            return state
+
         cards: dict[str, list[tuple[Path, bytes, dict[str, Any]]]] = {}
         invalid: set[str] = set()
         for folder in targets:
@@ -1375,31 +1413,34 @@ class DesktopBackend:
                     continue
                 try:
                     destination = self._contained_path(self.cache_dir, *folder.relative_to(self.cache_dir).parts, name)
-                    if previous is not None and self._root_is_running(root):
-                        skipped += 1
-                        issues.append(f"{root.name}/{name}: running profile; close it and sync again to update this card")
-                        continue
-                    if _load_json(self._contained_path(root, "config.json")).get("lastKnownAccountUuid") != account:
-                        raise DesktopBackendError("Profile identity changed during sync; verify this login first")
-                    self._contained_path(self.cache_dir, *source.relative_to(self.cache_dir).parts)
-                    if source.read_bytes() != data:
-                        raise DesktopBackendError("Source card changed during sync; retry")
-                    if backup is None:
-                        backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
-                    self._backup_history_card(source, data, backup)
-                    if previous is not None:
-                        self._backup_history_card(destination, previous, backup)
-                    warning = self._write_history_card(destination, data, previous)
-                    if previous is None:
-                        added += 1
-                    else:
-                        updated += 1
-                    if warning:
-                        issues.append(warning)
+                    if not write_blocked(root, False, adding=previous is None):
+                        if backup is None:
+                            backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
+                        self._backup_history_card(source, data, backup, backup_index)
+                        if previous is not None:
+                            self._backup_history_card(destination, previous, backup, backup_index)
+                        if not write_blocked(root, True, adding=previous is None):
+                            if _load_json(self._contained_path(root, "config.json")).get("lastKnownAccountUuid") != account:
+                                raise DesktopBackendError("Profile identity changed during sync; verify this login first")
+                            self._contained_path(self.cache_dir, *source.relative_to(self.cache_dir).parts)
+                            if source.read_bytes() != data:
+                                raise DesktopBackendError("Source card changed during sync; retry")
+                            warning = self._write_history_card(destination, data, previous)
+                            if previous is None:
+                                added += 1
+                            else:
+                                updated += 1
+                            if warning:
+                                issues.append(warning)
+                            continue
+                    skipped += 1
+                    issues.append(f"{root.name}/{name}: running profile; close it and sync again to update this card")
                 except (OSError, DesktopBackendError) as error:
                     failed += 1
                     issues.append(f"{folder}/{name}: {error}")
-        leases, lease_failures, lease_issues, backup = self._carry_worktree_leases(targets, backup)
+        leases, lease_failures, lease_issues, backup = self._carry_worktree_leases(
+            targets, write_blocked, backup, backup_index
+        )
         failed += lease_failures
         issues.extend(lease_issues)
         if not targets:
@@ -1412,7 +1453,8 @@ class DesktopBackend:
         )
 
     def _carry_worktree_leases(
-        self, targets: dict[Path, tuple[Path, str]], backup: Optional[Path]
+        self, targets: dict[Path, tuple[Path, str]], write_blocked: Callable[[Path, bool], bool],
+        backup: Optional[Path], backup_index: dict[str, dict[str, str]],
     ) -> tuple[int, int, list[str], Optional[Path]]:
         """Make each profile's worktree leases agree with the branch on disk.
 
@@ -1470,7 +1512,7 @@ class DesktopBackend:
             issues.append(f"{WORKTREE_REGISTRY}/{name}: two chats lease the checked-out branch; leases left for manual review")
 
         for root, path, raw, registry, chats in clones:
-            changed, running = [], None
+            changed = []
             for name, (entry, schema) in sorted(truth.items()):
                 current = registry["worktrees"].get(name)
                 # Only correct a wrong entry. A missing one is left to Desktop,
@@ -1481,22 +1523,25 @@ class DesktopBackend:
                 if registry.get("schemaVersion") != schema:
                     issues.append(f"{root.name}/{name}: worktree lease not carried; registry versions differ")
                     continue
-                running = self._root_is_running(root) if running is None else running
-                if running:
-                    issues.append(f"{root.name}/{name}: worktree lease is stale; close this profile and sync again so its chat can resume there")
-                    continue
                 registry["worktrees"][name] = entry
                 changed.append(name)
             if not changed:
                 continue
             try:
-                if backup is None:
-                    backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
-                self._backup_history_card(path, raw, backup)
-                warning = self._write_history_card(path, json.dumps(registry, indent=2).encode("utf-8"), raw)
-                carried += len(changed)
-                if warning:
-                    issues.append(warning)
+                if not write_blocked(root, False):
+                    if backup is None:
+                        backup = self._contained_path(self.cache_dir, "backups", f"cc-sync-{uuid.uuid4().hex}")
+                    self._backup_history_card(path, raw, backup, backup_index)
+                    if not write_blocked(root, True):
+                        warning = self._write_history_card(path, json.dumps(registry, indent=2).encode("utf-8"), raw)
+                        carried += len(changed)
+                        if warning:
+                            issues.append(warning)
+                        continue
+                issues.extend(
+                    f"{root.name}/{name}: worktree lease is stale; close this profile and sync again so its chat can resume there"
+                    for name in changed
+                )
             except (OSError, DesktopBackendError) as error:
                 failed += 1
                 issues.append(f"{root.name}/{WORKTREE_REGISTRY}: {error}")

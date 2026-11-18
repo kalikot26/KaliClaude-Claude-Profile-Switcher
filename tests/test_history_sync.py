@@ -5,9 +5,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
-from gui.desktop_backend import DesktopBackend, _sha256
+from gui.desktop_backend import DesktopBackend, _VerifiedDesktopProcess, _sha256
 
 
 ACCOUNT_A = "11111111-1111-4111-8111-111111111111"
@@ -99,6 +99,8 @@ class HistorySyncTests(unittest.TestCase):
                 saved_name = _sha256(str(b.relative_to(self.backend.desktop_data_dir))) + ".json"
                 backups = list(self.backend.backups_dir.glob("cc-sync-*/" + saved_name))
                 self.assertEqual([old], [p.read_bytes() for p in backups])
+                index = json.loads((backups[0].parent / "index.json").read_bytes())
+                self.assertEqual(_sha256(old), index[saved_name]["sha256"])
                 self.assertEqual(old, b.read_bytes())
                 self.assertEqual(a.read_bytes(), Path(source).read_bytes())
             return original_replace(source, destination)
@@ -253,6 +255,29 @@ class HistorySyncTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
 
+    def test_failed_index_commit_is_retried_before_reusing_a_backup(self):
+        gamma = self.profile("gamma", ACCOUNT_A, ORG_A)
+        source = self.card(self.alpha, isArchived=True)
+        stale = self.card(self.beta)
+        updated = self.card(gamma)
+        replace = os.replace
+
+        def fail_first_index_commit(temporary, destination):
+            if Path(destination).name == "index.json" and index_replace.call_count == 1:
+                raise OSError("index write failed")
+            return replace(temporary, destination)
+
+        with patch("gui.desktop_backend.os.replace", side_effect=fail_first_index_commit) as index_replace:
+            report = self.backend.sync_histories()
+        self.assertFalse(report.ok)
+        self.assertEqual((1, 1), (report.updated, report.failed))
+        self.assertFalse(json.loads(stale.read_bytes())["isArchived"])
+        self.assertEqual(source.read_bytes(), updated.read_bytes())
+        index = json.loads((report.backup.path / "index.json").read_bytes())
+        source_entry = next(entry for entry in index.values()
+                            if entry["path"] == source.relative_to(self.backend.desktop_data_dir).as_posix())
+        self.assertEqual(_sha256(source.read_bytes()), source_entry["sha256"])
+
     def test_post_commit_cleanup_error_still_reports_the_committed_addition(self):
         self.card(self.alpha)
         original_unlink = Path.unlink
@@ -343,10 +368,13 @@ class HistorySyncTests(unittest.TestCase):
     def test_running_profile_worktree_lease_is_flagged_not_written(self):
         _truth, _unrelated, _alpha_registry, beta_registry = self.stale_lease_fixture()
         before = beta_registry.read_bytes()
+        self.platform.desktop_processes.return_value = [
+            _VerifiedDesktopProcess(123, 0, "", user_data_dir=self.beta.parents[2])
+        ]
 
-        with patch.object(self.backend, "_root_is_running", return_value=True):
-            report = self.backend.sync_histories()
+        report = self.backend.sync_histories()
 
+        self.assertTrue((self.beta / CARD).is_file())
         self.assertEqual(0, report.leases)
         self.assertEqual(before, beta_registry.read_bytes())
         self.assertIn("wt1", report.message)
@@ -356,14 +384,77 @@ class HistorySyncTests(unittest.TestCase):
         self.card(self.alpha, isArchived=True)
         self.card(self.beta)
         before = self.snapshot(self.backend.desktop_data_dir)
-        with patch.object(self.backend, "_root_is_running", return_value=True):
-            report = self.backend.sync_histories()
+        self.platform.desktop_processes.return_value = [
+            _VerifiedDesktopProcess(123, 0, "", user_data_dir=self.beta.parents[2])
+        ]
+        report = self.backend.sync_histories()
         self.assertTrue(report.ok, report.message)
         self.assertEqual((0, 0), (report.updated, report.conflicts))
         self.assertIn("close it and sync again", report.message)
         self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
+        self.platform.desktop_processes.assert_called_once_with()
         self.platform.request_close.assert_not_called()
         self.platform.force_stop.assert_not_called()
+
+    def test_sync_rechecks_each_written_root_once_across_cards_and_leases(self):
+        self.stale_lease_fixture()
+        self.card(self.beta, CARD, activity="2026-09-10T05:00:00Z")
+        third = "local_55555555-5555-4555-8555-555555555555.json"
+        self.card(self.alpha, third, isArchived=True)
+        self.card(self.beta, third)
+        with patch.object(self.backend, "_root_is_running", wraps=self.backend._root_is_running) as recheck:
+            report = self.backend.sync_histories()
+        self.assertTrue(report.ok, report.message)
+        self.assertEqual((1, 2, 1), (report.added, report.updated, report.leases))
+        self.assertCountEqual([call(self.alpha.parents[2]), call(self.beta.parents[2])], recheck.call_args_list)
+        self.assertEqual(3, self.platform.desktop_processes.call_count)
+
+    def test_profile_launched_during_first_backup_is_skipped(self):
+        self.card(self.alpha, isArchived=True)
+        stale = self.card(self.beta)
+        self.card(self.alpha, OTHER)
+        before = self.snapshot(self.backend.desktop_data_dir)
+        process = _VerifiedDesktopProcess(123, 0, "", user_data_dir=self.beta.parents[2])
+        with patch.object(self.backend, "_backup_history_card", wraps=self.backend._backup_history_card) as backup:
+            self.platform.desktop_processes.side_effect = lambda: [process] if backup.called else []
+            report = self.backend.sync_histories()
+        self.assertTrue(report.ok, report.message)
+        self.assertEqual((0, 0), (report.added, report.updated))
+        self.assertIn(f"beta/{stale.name}: running profile; close it and sync again", report.message)
+        self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
+        self.assertEqual(2, self.platform.desktop_processes.call_count)
+
+    def test_process_query_failure_blocks_all_writes_to_the_root_and_is_memoized(self):
+        self.card(self.alpha, isArchived=True)
+        self.card(self.beta)
+        self.card(self.alpha, OTHER)
+        before = self.snapshot(self.backend.desktop_data_dir)
+        error = OSError("cannot verify Desktop processes")
+        for results in ([error], [[], error]):
+            with self.subTest(failed_at=len(results)):
+                self.platform.desktop_processes.reset_mock(side_effect=True)
+                self.platform.desktop_processes.side_effect = results
+                report = self.backend.sync_histories()
+                self.assertFalse(report.ok)
+                self.assertEqual((0, 0, 2), (report.added, report.updated, report.failed))
+                self.assertIn(str(error), report.message)
+                self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
+                self.assertEqual(len(results), self.platform.desktop_processes.call_count)
+
+    def test_lease_only_sync_rechecks_before_write_and_fails_closed(self):
+        _truth, _unrelated, _alpha_registry, beta_registry = self.stale_lease_fixture()
+        (self.beta / CARD).write_bytes((self.alpha / CARD).read_bytes())
+        (self.alpha / OTHER).write_bytes((self.beta / OTHER).read_bytes())
+        before = beta_registry.read_bytes()
+        self.platform.desktop_processes.side_effect = [[], OSError("process query failed")]
+
+        report = self.backend.sync_histories()
+
+        self.assertFalse(report.ok)
+        self.assertEqual((0, 0, 0, 1), (report.added, report.updated, report.leases, report.failed))
+        self.assertIn("beta/git-worktrees.json: process query failed", report.message)
+        self.assertEqual(before, beta_registry.read_bytes())
+        self.assertEqual(2, self.platform.desktop_processes.call_count)
 
     def test_default_foreign_and_agent_mode_files_and_jsonl_are_not_read_or_written(self):
         self.card(self.alpha)
