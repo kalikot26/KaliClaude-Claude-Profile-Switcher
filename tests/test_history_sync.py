@@ -133,13 +133,58 @@ class HistorySyncTests(unittest.TestCase):
         self.assertEqual(1, report.added, report.message)
         self.assertEqual(a.read_bytes(), (self.beta / CARD).read_bytes())
 
-    def test_archive_disagreement_never_unarchives_or_broadcasts_to_absent_target(self):
-        gamma = self.profile("gamma", ACCOUNT_A, ORG_A)
-        self.card(self.alpha, isArchived=True, archivedAt="2026-09-10T00:00:00Z")
-        self.card(self.beta, activity="2026-09-11T06:00:00Z", isArchived=False)
-        before = self.snapshot(self.backend.desktop_data_dir)
+    def test_equal_activity_prefers_archived_and_copies_all_fields(self):
+        archived = self.card(self.alpha, isArchived=True, autoArchiveExempt=True,
+                             archivedAt="2026-09-11T06:00:00Z")
+        active = self.card(self.beta, autoArchiveExempt=False)
+        expected = archived.read_bytes()
+
         report = self.backend.sync_histories()
-        self.assertEqual(1, report.conflicts)
+
+        self.assertEqual((0, 1, 0), (report.added, report.updated, report.conflicts))
+        self.assertEqual(expected, active.read_bytes())
+
+    def test_newer_archived_copy_wins(self):
+        active = self.card(self.alpha)
+        archived = self.card(self.beta, activity="2026-09-11T06:00:00Z", isArchived=True)
+        expected = archived.read_bytes()
+
+        report = self.backend.sync_histories()
+
+        self.assertEqual((0, 1, 0), (report.added, report.updated, report.conflicts))
+        self.assertEqual(expected, active.read_bytes())
+
+    def test_equal_activity_requires_a_boolean_true_to_count_as_archived(self):
+        active = self.card(self.alpha, isArchived=1)
+        archived = self.card(self.beta, isArchived=True)
+        expected = archived.read_bytes()
+
+        report = self.backend.sync_histories()
+
+        self.assertEqual((1, 0), (report.updated, report.conflicts))
+        self.assertEqual(expected, active.read_bytes())
+
+    def test_newer_unarchived_copy_updates_existing_and_absent_targets(self):
+        gamma = self.profile("gamma", ACCOUNT_A, ORG_A)
+        archived = self.card(self.alpha, isArchived=True, archivedAt="2026-09-10T00:00:00Z")
+        active = self.card(self.beta, activity="2026-09-11T06:00:00Z", isArchived=False)
+        expected = active.read_bytes()
+
+        report = self.backend.sync_histories()
+
+        self.assertEqual((1, 1, 0), (report.added, report.updated, report.conflicts))
+        self.assertEqual(expected, archived.read_bytes())
+        self.assertEqual(expected, (gamma / CARD).read_bytes())
+
+    def test_unknown_activity_blocks_archive_propagation(self):
+        gamma = self.profile("gamma", ACCOUNT_A, ORG_A)
+        self.card(self.alpha, isArchived=True)
+        self.card(self.beta, activity=None)
+        before = self.snapshot(self.backend.desktop_data_dir)
+
+        report = self.backend.sync_histories()
+
+        self.assertEqual((0, 0, 1), (report.added, report.updated, report.conflicts))
         self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
         self.assertFalse((gamma / CARD).exists())
 
@@ -308,13 +353,13 @@ class HistorySyncTests(unittest.TestCase):
         self.assertIn("close this profile and sync again", report.message)
 
     def test_running_profile_updates_are_skipped_without_stopping_sessions(self):
-        self.card(self.alpha, activity="2026-09-11T06:00:00Z")
+        self.card(self.alpha, isArchived=True)
         self.card(self.beta)
         before = self.snapshot(self.backend.desktop_data_dir)
         with patch.object(self.backend, "_root_is_running", return_value=True):
             report = self.backend.sync_histories()
         self.assertTrue(report.ok, report.message)
-        self.assertEqual(0, report.updated)
+        self.assertEqual((0, 0), (report.updated, report.conflicts))
         self.assertIn("close it and sync again", report.message)
         self.assertEqual(before, self.snapshot(self.backend.desktop_data_dir))
         self.platform.request_close.assert_not_called()

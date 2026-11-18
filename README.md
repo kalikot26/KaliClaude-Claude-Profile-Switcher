@@ -25,9 +25,11 @@ credentials.
   keeps several CLI accounts signed in at once with usage-limit failover.
 - **Sync History** shares local Claude Code `local_*.json` cards across saved
   accounts, only into each profile's own verified account/org directory.
-  Missing cards are added; embedded `lastActivityAt` determines newer copies,
-  never filesystem modification time. Unknown freshness or differing archive
-  state is preserved for review. Existing cards in running profiles are skipped.
+  Missing cards are added from the winning copy. Embedded `lastActivityAt`
+  determines newer copies. An archived copy wins at equal activity, so a card
+  only becomes unarchived if the conversation was resumed later. Sync preserves
+  conflicting copies for review when any activity is unknown or the top-ranked
+  copies still differ. Existing cards in running profiles are skipped.
   Verified card-only backups precede writes; missing files never cause deletion.
   Logins, the default root, cloud chats, groups and agent-mode state stay separate.
   Conversation JSONL files are never read or changed. No sessions are stopped;
